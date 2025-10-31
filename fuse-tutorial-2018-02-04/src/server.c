@@ -22,6 +22,25 @@
 // Global storage directory
 char storage_dir[PATH_MAX];
 
+// Helper function to send all data (handles partial sends)
+static ssize_t send_all(int sockfd, const void* buf, size_t len) {
+    size_t total_sent = 0;
+    const char* ptr = (const char*)buf;
+    
+    while (total_sent < len) {
+        ssize_t sent = send(sockfd, ptr + total_sent, len - total_sent, 0);
+        if (sent < 0) {
+            if (errno == EINTR) continue;  // Interrupted, retry
+            return -1;  // Error
+        }
+        if (sent == 0) {
+            return -1;  // Connection closed
+        }
+        total_sent += sent;
+    }
+    return total_sent;
+}
+
 // Function to handle client request
 void* handle_client(void* arg) {
     int client_sock = *(int*)arg;
@@ -53,7 +72,7 @@ void* handle_client(void* arg) {
                 resp.status = -1;
                 resp.error_code = ENOMEM;
                 resp.size = 0;
-                send(client_sock, &resp, sizeof(resp), 0);
+                send_all(client_sock, &resp, sizeof(resp));
                 continue;
             }
             
@@ -64,7 +83,7 @@ void* handle_client(void* arg) {
                 resp.status = -1;
                 resp.error_code = errno;
                 resp.size = 0;
-                send(client_sock, &resp, sizeof(resp), 0);
+                send_all(client_sock, &resp, sizeof(resp));
                 free(data_buffer);
                 continue;
             }
@@ -76,7 +95,7 @@ void* handle_client(void* arg) {
                 resp.status = -1;
                 resp.error_code = errno;
                 resp.size = 0;
-                send(client_sock, &resp, sizeof(resp), 0);
+                send_all(client_sock, &resp, sizeof(resp));
                 free(data_buffer);
                 continue;
             }
@@ -97,7 +116,7 @@ void* handle_client(void* arg) {
                 resp.size = written;
             }
             
-            send(client_sock, &resp, sizeof(resp), 0);
+            send_all(client_sock, &resp, sizeof(resp));
             
         } else if (req.type == REQ_READ) {
             // Open file
@@ -107,7 +126,7 @@ void* handle_client(void* arg) {
                 resp.status = -1;
                 resp.error_code = errno;
                 resp.size = 0;
-                send(client_sock, &resp, sizeof(resp), 0);
+                send_all(client_sock, &resp, sizeof(resp));
                 continue;
             }
             
@@ -117,7 +136,7 @@ void* handle_client(void* arg) {
                 resp.status = -1;
                 resp.error_code = ENOMEM;
                 resp.size = 0;
-                send(client_sock, &resp, sizeof(resp), 0);
+                send_all(client_sock, &resp, sizeof(resp));
                 close(fd);
                 continue;
             }
@@ -131,7 +150,7 @@ void* handle_client(void* arg) {
                 resp.status = -1;
                 resp.error_code = errno;
                 resp.size = 0;
-                send(client_sock, &resp, sizeof(resp), 0);
+                send_all(client_sock, &resp, sizeof(resp));
                 free(data_buffer);
                 continue;
             }
@@ -140,11 +159,11 @@ void* handle_client(void* arg) {
             resp.status = 0;
             resp.error_code = 0;
             resp.size = nread;
-            send(client_sock, &resp, sizeof(resp), 0);
+            send_all(client_sock, &resp, sizeof(resp));
             
             // Send data
             if (nread > 0) {
-                send(client_sock, data_buffer, nread, 0);
+                send_all(client_sock, data_buffer, nread);
             }
             
             free(data_buffer);
@@ -160,7 +179,7 @@ void* handle_client(void* arg) {
                 resp.error_code = 0;
             }
             resp.size = 0;
-            send(client_sock, &resp, sizeof(resp), 0);
+            send_all(client_sock, &resp, sizeof(resp));
         }
     }
     

@@ -67,6 +67,25 @@ static void bb_fullpath(char fpath[PATH_MAX], const char *path)
 // MYFS Helper Functions
 ///////////////////////////////////////////////////////////
 
+// Helper function to send all data (handles partial sends)
+static ssize_t send_all(int sockfd, const void* buf, size_t len) {
+    size_t total_sent = 0;
+    const char* ptr = (const char*)buf;
+    
+    while (total_sent < len) {
+        ssize_t sent = send(sockfd, ptr + total_sent, len - total_sent, 0);
+        if (sent < 0) {
+            if (errno == EINTR) continue;  // Interrupted, retry
+            return -1;  // Error
+        }
+        if (sent == 0) {
+            return -1;  // Connection closed
+        }
+        total_sent += sent;
+    }
+    return total_sent;
+}
+
 // Connect to a storage node
 static int connect_to_node(const char* host, int port) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -143,6 +162,7 @@ static int myfs_write(const char* path, const char* buf, size_t size, off_t offs
     int num_nodes = state->num_nodes;
     int num_data_fragments = num_nodes - 1;  // n-1 data fragments
     
+    fprintf(stderr, "[MYFS WRITE] ========== START ==========\n");
     fprintf(stderr, "[MYFS WRITE] path=%s, size=%zu, offset=%ld, nodes=%d\n", 
             path, size, offset, num_nodes);
     log_msg("\n[MYFS WRITE] path=%s, size=%zu, offset=%ld, num_nodes=%d\n", 
@@ -150,27 +170,62 @@ static int myfs_write(const char* path, const char* buf, size_t size, off_t offs
     
     // Calculate fragment size (divide data among n-1 nodes)
     size_t fragment_size = (size + num_data_fragments - 1) / num_data_fragments;
+    fprintf(stderr, "[MYFS WRITE] Fragment size: %zu bytes (size=%zu, fragments=%d)\n", 
+            fragment_size, size, num_data_fragments);
+    log_msg("[MYFS WRITE] Fragment size: %zu bytes\n", fragment_size);
     
     // Allocate buffers for fragments
+    fprintf(stderr, "[MYFS WRITE] Allocating memory: %d fragments × %zu bytes = %zu bytes total\n",
+            num_nodes, fragment_size, num_nodes * fragment_size);
+    
     char** fragments = (char**)malloc(num_nodes * sizeof(char*));
-    for (int i = 0; i < num_nodes; i++) {
-        fragments[i] = (char*)calloc(fragment_size, 1);
+    if (!fragments) {
+        fprintf(stderr, "[MYFS WRITE ERROR] Failed to allocate fragment pointer array\n");
+        log_msg("[MYFS WRITE ERROR] Failed to allocate fragment pointer array\n");
+        return -ENOMEM;
     }
     
+    // Initialize all pointers to NULL for safe cleanup
+    for (int i = 0; i < num_nodes; i++) {
+        fragments[i] = NULL;
+    }
+    
+    // Allocate each fragment buffer
+    for (int i = 0; i < num_nodes; i++) {
+        fragments[i] = (char*)calloc(fragment_size, 1);
+        if (!fragments[i]) {
+            fprintf(stderr, "[MYFS WRITE ERROR] Failed to allocate fragment %d buffer (%zu bytes)\n", 
+                    i, fragment_size);
+            log_msg("[MYFS WRITE ERROR] Failed to allocate fragment %d buffer\n", i);
+            // Clean up already allocated buffers
+            for (int j = 0; j < i; j++) {
+                free(fragments[j]);
+            }
+            free(fragments);
+            return -ENOMEM;
+        }
+    }
+    fprintf(stderr, "[MYFS WRITE] ✓ Memory allocated successfully\n");
+    
     // Split data into n-1 fragments
+    fprintf(stderr, "[MYFS WRITE] Splitting data into %d data fragments...\n", num_data_fragments);
     for (size_t i = 0; i < size; i++) {
         int frag_idx = (i / fragment_size) % num_data_fragments;
         size_t pos = i % fragment_size;
         fragments[frag_idx][pos] = buf[i];
     }
+    fprintf(stderr, "[MYFS WRITE] ✓ Data split complete\n");
     
     // Calculate parity fragment (XOR of all data fragments)
+    fprintf(stderr, "[MYFS WRITE] Calculating parity (XOR) for fragment %d...\n", num_nodes - 1);
     memset(fragments[num_nodes - 1], 0, fragment_size);
     for (int i = 0; i < num_data_fragments; i++) {
         xor_buffers(fragments[num_nodes - 1], fragments[i], fragment_size);
     }
+    fprintf(stderr, "[MYFS WRITE] ✓ Parity calculated\n");
     
     // Send fragments to nodes
+    fprintf(stderr, "[MYFS WRITE] Sending fragments to %d nodes...\n", num_nodes);
     int retstat = 0;
     for (int i = 0; i < num_nodes; i++) {
         request_header_t req;
@@ -182,46 +237,65 @@ static int myfs_write(const char* path, const char* buf, size_t size, off_t offs
         req.offset = offset / num_data_fragments;  // Adjust offset for fragment
         req.fragment_id = i;
         
+        fprintf(stderr, "[MYFS WRITE] Node %d: Sending header (file=%s, frag=%u, size=%zu, offset=%ld)...\n",
+                i, req.filename, req.fragment_id, req.size, req.offset);
+        
         // Send request header
-        if (send(state->nodes[i].socket_fd, &req, sizeof(req), 0) != sizeof(req)) {
+        if (send_all(state->nodes[i].socket_fd, &req, sizeof(req)) != sizeof(req)) {
+            fprintf(stderr, "[MYFS WRITE ERROR] Failed to send request header to node %d\n", i);
             log_msg("Failed to send request to node %d\n", i);
             retstat = -EIO;
             goto cleanup;
         }
         
+        fprintf(stderr, "[MYFS WRITE] Node %d: Sending data (%zu bytes)...\n", i, fragment_size);
+        
         // Send data
-        if (send(state->nodes[i].socket_fd, fragments[i], fragment_size, 0) != (ssize_t)fragment_size) {
+        if (send_all(state->nodes[i].socket_fd, fragments[i], fragment_size) != (ssize_t)fragment_size) {
+            fprintf(stderr, "[MYFS WRITE ERROR] Failed to send data to node %d\n", i);
             log_msg("Failed to send data to node %d\n", i);
             retstat = -EIO;
             goto cleanup;
         }
         
+        fprintf(stderr, "[MYFS WRITE] Node %d: Waiting for response...\n", i);
+        
         // Receive response
         if (recv(state->nodes[i].socket_fd, &resp, sizeof(resp), MSG_WAITALL) != sizeof(resp)) {
+            fprintf(stderr, "[MYFS WRITE ERROR] Failed to receive response from node %d\n", i);
             log_msg("Failed to receive response from node %d\n", i);
             retstat = -EIO;
             goto cleanup;
         }
         
         if (resp.status != 0) {
-            fprintf(stderr, "[MYFS WRITE ERROR] Node %d returned error: %d\n", i, resp.error_code);
+            fprintf(stderr, "[MYFS WRITE ERROR] Node %d returned error: status=%d, errno=%d\n", 
+                    i, resp.status, resp.error_code);
             log_msg("[MYFS WRITE ERROR] Node %d returned error: %d\n", i, resp.error_code);
             retstat = -resp.error_code;
             goto cleanup;
         }
         
-        fprintf(stderr, "[MYFS WRITE] ✓ Fragment %d written to node %d (%zu bytes)\n", i, i, fragment_size);
+        fprintf(stderr, "[MYFS WRITE] ✓ Node %d: Fragment %d written successfully (%zu bytes)\n", 
+                i, i, fragment_size);
         log_msg("[MYFS WRITE] Successfully wrote fragment %d to node %d\n", i, i);
     }
     
-    fprintf(stderr, "[MYFS WRITE] ✓ Write complete: %zu bytes\n", size);
+    fprintf(stderr, "[MYFS WRITE] ========== COMPLETE: %zu bytes written ==========\n", size);
     retstat = size;  // Return number of bytes written
     
 cleanup:
+    fprintf(stderr, "[MYFS WRITE] Cleanup: Freeing %d fragment buffers\n", num_nodes);
     for (int i = 0; i < num_nodes; i++) {
-        free(fragments[i]);
+        if (fragments[i]) {
+            free(fragments[i]);
+        }
     }
     free(fragments);
+    
+    if (retstat < 0) {
+        fprintf(stderr, "[MYFS WRITE] ========== FAILED: error=%d ==========\n", retstat);
+    }
     
     return retstat;
 }
@@ -232,6 +306,7 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
     int num_nodes = state->num_nodes;
     int num_data_fragments = num_nodes - 1;
     
+    fprintf(stderr, "[MYFS READ] ========== START ==========\n");
     fprintf(stderr, "[MYFS READ] path=%s, size=%zu, offset=%ld, nodes=%d\n", 
             path, size, offset, num_nodes);
     log_msg("\n[MYFS READ] path=%s, size=%zu, offset=%ld, num_nodes=%d\n", 
@@ -239,16 +314,50 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
     
     // Calculate fragment size
     size_t fragment_size = (size + num_data_fragments - 1) / num_data_fragments;
+    fprintf(stderr, "[MYFS READ] Fragment size: %zu bytes (size=%zu, fragments=%d)\n", 
+            fragment_size, size, num_data_fragments);
     
     // Allocate buffers for fragments
-    char** fragments = (char**)malloc(num_nodes * sizeof(char*));
-    int* node_status = (int*)calloc(num_nodes, sizeof(int));  // 0=failed, 1=success
+    fprintf(stderr, "[MYFS READ] Allocating memory: %d fragments × %zu bytes = %zu bytes total\n",
+            num_nodes, fragment_size, num_nodes * fragment_size);
     
-    for (int i = 0; i < num_nodes; i++) {
-        fragments[i] = (char*)calloc(fragment_size, 1);
+    char** fragments = (char**)malloc(num_nodes * sizeof(char*));
+    if (!fragments) {
+        fprintf(stderr, "[MYFS READ ERROR] Failed to allocate fragment pointer array\n");
+        return -ENOMEM;
     }
     
+    int* node_status = (int*)calloc(num_nodes, sizeof(int));  // 0=failed, 1=success
+    if (!node_status) {
+        fprintf(stderr, "[MYFS READ ERROR] Failed to allocate node_status array\n");
+        free(fragments);
+        return -ENOMEM;
+    }
+    
+    // Initialize all pointers to NULL
+    for (int i = 0; i < num_nodes; i++) {
+        fragments[i] = NULL;
+    }
+    
+    // Allocate each fragment buffer
+    for (int i = 0; i < num_nodes; i++) {
+        fragments[i] = (char*)calloc(fragment_size, 1);
+        if (!fragments[i]) {
+            fprintf(stderr, "[MYFS READ ERROR] Failed to allocate fragment %d buffer (%zu bytes)\n", 
+                    i, fragment_size);
+            // Clean up
+            for (int j = 0; j < i; j++) {
+                free(fragments[j]);
+            }
+            free(fragments);
+            free(node_status);
+            return -ENOMEM;
+        }
+    }
+    fprintf(stderr, "[MYFS READ] ✓ Memory allocated successfully\n");
+    
     // Try to read from all nodes
+    fprintf(stderr, "[MYFS READ] Reading fragments from %d nodes...\n", num_nodes);
     for (int i = 0; i < num_nodes; i++) {
         request_header_t req;
         response_header_t resp;
@@ -259,8 +368,12 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         req.offset = offset / num_data_fragments;
         req.fragment_id = i;
         
+        fprintf(stderr, "[MYFS READ] Node %d: Sending read request (file=%s, frag=%u, size=%zu, offset=%ld)...\n",
+                i, req.filename, req.fragment_id, req.size, req.offset);
+        
         // Send request
-        if (send(state->nodes[i].socket_fd, &req, sizeof(req), 0) != sizeof(req)) {
+        if (send_all(state->nodes[i].socket_fd, &req, sizeof(req)) != sizeof(req)) {
+            fprintf(stderr, "[MYFS READ] ✗ Node %d: Failed to send request\n", i);
             log_msg("Failed to send read request to node %d\n", i);
             node_status[i] = 0;
             continue;
@@ -268,21 +381,27 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         
         // Receive response
         if (recv(state->nodes[i].socket_fd, &resp, sizeof(resp), MSG_WAITALL) != sizeof(resp)) {
+            fprintf(stderr, "[MYFS READ] ✗ Node %d: Failed to receive response\n", i);
             log_msg("Failed to receive response from node %d\n", i);
             node_status[i] = 0;
             continue;
         }
         
         if (resp.status != 0) {
+            fprintf(stderr, "[MYFS READ] ✗ Node %d: Server returned error: status=%d, errno=%d\n", 
+                    i, resp.status, resp.error_code);
             log_msg("Node %d returned error: %d\n", i, resp.error_code);
             node_status[i] = 0;
             continue;
         }
         
         // Receive data
+        fprintf(stderr, "[MYFS READ] Node %d: Receiving data (%zu bytes)...\n", i, resp.size);
         if (resp.size > 0) {
             ssize_t received = recv(state->nodes[i].socket_fd, fragments[i], resp.size, MSG_WAITALL);
             if (received != (ssize_t)resp.size) {
+                fprintf(stderr, "[MYFS READ] ✗ Node %d: Failed to receive data (expected %zu, got %zd)\n", 
+                        i, resp.size, received);
                 log_msg("Failed to receive data from node %d\n", i);
                 node_status[i] = 0;
                 continue;
@@ -290,6 +409,7 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         }
         
         node_status[i] = 1;
+        fprintf(stderr, "[MYFS READ] ✓ Node %d: Fragment read successfully (%zu bytes)\n", i, resp.size);
         log_msg("Successfully read fragment %d from node %d\n", i, i);
     }
     

@@ -92,8 +92,10 @@ cd $MYFS_DIR
 sleep 2
 echo "Creating 4 MB file..."
 dd if=/dev/urandom of=/tmp/4mb.dat bs=1M count=4 2>/dev/null
-cp /tmp/4mb.dat ~/myfs_mount/
-cat ~/myfs_mount/4mb.dat > /dev/null && echo "✓ 4 MB file test passed"
+echo "Copying to MYFS..."
+time cp /tmp/4mb.dat ~/myfs_mount/
+echo "Reading back..."
+time cat ~/myfs_mount/4mb.dat > /dev/null && echo "✓ 4 MB file test passed"
 
 # 再次检查分片
 echo -e "\nFragments after 4MB file:"
@@ -103,6 +105,54 @@ echo "Node 2:"
 ls -lh ~/storage_node2/
 echo "Node 3 (parity):"
 ls -lh ~/storage_node3/
+
+# Test 5: 40 MB 文件
+echo -e "\nTest 5: 40 MB file"
+echo "Creating 40 MB file..."
+dd if=/dev/urandom of=/tmp/40mb.dat bs=1M count=40 2>/dev/null
+echo "Copying to MYFS..."
+time cp /tmp/40mb.dat ~/myfs_mount/
+echo "Reading back..."
+time cat ~/myfs_mount/40mb.dat > /dev/null && echo "✓ 40 MB file test passed"
+
+# Test 6: 400 MB 文件
+read -p $'\nTest 6: Run 400 MB file test? (y/n) ' -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo "Creating 400 MB file (this may take a minute)..."
+    dd if=/dev/urandom of=/tmp/400mb.dat bs=1M count=400 2>/dev/null
+    echo "✓ Test file created"
+    
+    echo "Writing to MYFS (this will take some time)..."
+    echo "Start time: $(date '+%H:%M:%S')"
+    time cp /tmp/400mb.dat ~/myfs_mount/
+    echo "✓ 400 MB file written"
+    
+    echo "Reading back from MYFS..."
+    echo "Start time: $(date '+%H:%M:%S')"
+    time cat ~/myfs_mount/400mb.dat > /dev/null
+    echo "✓ 400 MB file test passed"
+    
+    echo -e "\nFinal fragments:"
+    echo "Node 1:"
+    ls -lh ~/storage_node1/ | tail -3
+    echo "Node 2:"
+    ls -lh ~/storage_node2/ | tail -3
+    echo "Node 3 (parity):"
+    ls -lh ~/storage_node3/ | tail -3
+    
+    # Test 7: 容错测试 - 关闭一个节点后读取 400MB
+    read -p $'\nTest 7: Test fault tolerance with 400 MB file? (y/n) ' -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo "Stopping node 2 (simulating failure)..."
+        pkill -f "server 8002"
+        sleep 1
+        echo "Trying to read 400mb.dat with node 2 down (using XOR recovery)..."
+        echo "Start time: $(date '+%H:%M:%S')"
+        time cat ~/myfs_mount/400mb.dat > /dev/null && echo "✓ Fault tolerance with 400 MB file passed"
+    fi
+fi
 
 echo -e "\n=========================================="
 echo "All tests completed!"

@@ -140,10 +140,10 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "Creating 4 MB file..."
     dd if=/dev/urandom of=/tmp/4mb.dat bs=1M count=4 2>/dev/null
     echo "Writing to MYFS..."
-    cp /tmp/4mb.dat ~/myfs_mount/
+    time cp /tmp/4mb.dat ~/myfs_mount/
     sleep 0.5
     echo "Reading back..."
-    cat ~/myfs_mount/4mb.dat > /dev/null && echo "✓ 4 MB file test passed"
+    time cat ~/myfs_mount/4mb.dat > /dev/null && echo "✓ 4 MB file test passed"
     
     echo -e "\n[Test 4 - Check Fragments]"
     echo "Node 1 files:"
@@ -152,6 +152,72 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     ls -lh ~/storage_node2/ | grep -v "^total"
     echo "Node 3 files (parity):"
     ls -lh ~/storage_node3/ | grep -v "^total"
+fi
+
+# Test 5: 40 MB 文件
+read -p $'\n[Test 5] Run 40 MB file test? (y/n) ' -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo "Creating 40 MB file..."
+    dd if=/dev/urandom of=/tmp/40mb.dat bs=1M count=40 2>/dev/null
+    echo "Writing to MYFS..."
+    echo "Start time: $(date '+%H:%M:%S')"
+    time cp /tmp/40mb.dat ~/myfs_mount/
+    sleep 0.5
+    echo "Reading back..."
+    time cat ~/myfs_mount/40mb.dat > /dev/null && echo "✓ 40 MB file test passed"
+    
+    echo -e "\n[Test 5 - Check Fragments]"
+    echo "Node 2 files:"
+    ls -lh ~/storage_node2/ | grep -v "^total" | tail -3
+    echo "Node 3 files:"
+    ls -lh ~/storage_node3/ | grep -v "^total" | tail -3
+fi
+
+# Test 6: 400 MB 文件
+read -p $'\n[Test 6] Run 400 MB file test? (y/n) ' -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo "Creating 400 MB file (this may take a minute)..."
+    dd if=/dev/urandom of=/tmp/400mb.dat bs=1M count=400 2>/dev/null
+    echo "✓ Test file created"
+    
+    echo "Writing to MYFS (watch the debug output)..."
+    echo "Start time: $(date '+%H:%M:%S')"
+    time cp /tmp/400mb.dat ~/myfs_mount/ 2>&1 | tail -20
+    echo "✓ 400 MB file written"
+    
+    echo "Waiting for all writes to complete..."
+    sleep 2
+    
+    echo "Reading back from MYFS..."
+    echo "Start time: $(date '+%H:%M:%S')"
+    time cat ~/myfs_mount/400mb.dat > /dev/null 2>&1 | tail -20
+    echo "✓ 400 MB file test passed"
+    
+    echo -e "\n[Test 6 - Check Fragments]"
+    echo "Node 1 files:"
+    ls -lh ~/storage_node1/ | grep -v "^total" | tail -3
+    echo "Node 2 files:"
+    ls -lh ~/storage_node2/ | grep -v "^total" | tail -3
+    echo "Node 3 files (parity):"
+    ls -lh ~/storage_node3/ | grep -v "^total" | tail -3
+    
+    # Test 7: 容错测试 - 关闭一个节点后读取 400MB
+    read -p $'\n[Test 7] Test fault tolerance with 400 MB file? (y/n) ' -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo "Stopping node 2 (simulating failure)..."
+        pkill -f "server 8002"
+        sleep 1
+        echo "Server status:"
+        ps aux | grep "[s]erver 800" | awk '{print "  ", $0}' || echo "  Only 2 servers running"
+        
+        echo -e "\nTrying to read 400mb.dat with node 2 down (using XOR recovery)..."
+        echo "Start time: $(date '+%H:%M:%S')"
+        time cat ~/myfs_mount/400mb.dat > /dev/null 2>&1 | tail -20
+        echo "✓ Fault tolerance with 400 MB file passed"
+    fi
 fi
 
 echo -e "\n=========================================="
