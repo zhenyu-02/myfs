@@ -36,12 +36,17 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 
 #ifdef HAVE_SYS_XATTR_H
 #include <sys/xattr.h>
 #endif
 
 #include "log.h"
+#include "protocol.h"
 
 //  All the paths I see are relative to the root of the mounted
 //  filesystem.  In order to get to the underlying filesystem, I need to
@@ -56,6 +61,279 @@ static void bb_fullpath(char fpath[PATH_MAX], const char *path)
 
     log_msg("    bb_fullpath:  rootdir = \"%s\", path = \"%s\", fpath = \"%s\"\n",
 	    BB_DATA->rootdir, path, fpath);
+}
+
+///////////////////////////////////////////////////////////
+// MYFS Helper Functions
+///////////////////////////////////////////////////////////
+
+// Connect to a storage node
+static int connect_to_node(const char* host, int port) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("socket");
+        return -1;
+    }
+    
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    
+    // Try to convert host as IP address first
+    if (inet_pton(AF_INET, host, &server_addr.sin_addr) <= 0) {
+        // If not an IP, try to resolve as hostname
+        struct hostent* he = gethostbyname(host);
+        if (he == NULL) {
+            fprintf(stderr, "Failed to resolve host: %s\n", host);
+            close(sock);
+            return -1;
+        }
+        memcpy(&server_addr.sin_addr, he->h_addr_list[0], he->h_length);
+    }
+    
+    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("connect");
+        close(sock);
+        return -1;
+    }
+    
+    return sock;
+}
+
+// Initialize connections to all nodes
+static int init_node_connections() {
+    struct bb_state* state = BB_DATA;
+    
+    for (int i = 0; i < state->num_nodes; i++) {
+        log_msg("Connecting to node %d: %s:%d\n", i, state->nodes[i].host, state->nodes[i].port);
+        
+        state->nodes[i].socket_fd = connect_to_node(state->nodes[i].host, state->nodes[i].port);
+        if (state->nodes[i].socket_fd < 0) {
+            fprintf(stderr, "Failed to connect to node %d (%s:%d)\n", 
+                    i, state->nodes[i].host, state->nodes[i].port);
+            return -1;
+        }
+        
+        log_msg("Connected to node %d, socket fd=%d\n", i, state->nodes[i].socket_fd);
+    }
+    
+    return 0;
+}
+
+// XOR data buffers for parity calculation
+static void xor_buffers(char* dest, const char* src, size_t size) {
+    for (size_t i = 0; i < size; i++) {
+        dest[i] ^= src[i];
+    }
+}
+
+// Distributed write function
+static int myfs_write(const char* path, const char* buf, size_t size, off_t offset) {
+    struct bb_state* state = BB_DATA;
+    int num_nodes = state->num_nodes;
+    int num_data_fragments = num_nodes - 1;  // n-1 data fragments
+    
+    log_msg("\nmyfs_write: path=%s, size=%zu, offset=%ld, num_nodes=%d\n", 
+            path, size, offset, num_nodes);
+    
+    // Calculate fragment size (divide data among n-1 nodes)
+    size_t fragment_size = (size + num_data_fragments - 1) / num_data_fragments;
+    
+    // Allocate buffers for fragments
+    char** fragments = (char**)malloc(num_nodes * sizeof(char*));
+    for (int i = 0; i < num_nodes; i++) {
+        fragments[i] = (char*)calloc(fragment_size, 1);
+    }
+    
+    // Split data into n-1 fragments
+    for (size_t i = 0; i < size; i++) {
+        int frag_idx = (i / fragment_size) % num_data_fragments;
+        size_t pos = i % fragment_size;
+        fragments[frag_idx][pos] = buf[i];
+    }
+    
+    // Calculate parity fragment (XOR of all data fragments)
+    memset(fragments[num_nodes - 1], 0, fragment_size);
+    for (int i = 0; i < num_data_fragments; i++) {
+        xor_buffers(fragments[num_nodes - 1], fragments[i], fragment_size);
+    }
+    
+    // Send fragments to nodes
+    int retstat = 0;
+    for (int i = 0; i < num_nodes; i++) {
+        request_header_t req;
+        response_header_t resp;
+        
+        req.type = REQ_WRITE;
+        strncpy(req.filename, path + 1, sizeof(req.filename) - 1);  // Skip leading '/'
+        req.size = fragment_size;
+        req.offset = offset / num_data_fragments;  // Adjust offset for fragment
+        req.fragment_id = i;
+        
+        // Send request header
+        if (send(state->nodes[i].socket_fd, &req, sizeof(req), 0) != sizeof(req)) {
+            log_msg("Failed to send request to node %d\n", i);
+            retstat = -EIO;
+            goto cleanup;
+        }
+        
+        // Send data
+        if (send(state->nodes[i].socket_fd, fragments[i], fragment_size, 0) != (ssize_t)fragment_size) {
+            log_msg("Failed to send data to node %d\n", i);
+            retstat = -EIO;
+            goto cleanup;
+        }
+        
+        // Receive response
+        if (recv(state->nodes[i].socket_fd, &resp, sizeof(resp), MSG_WAITALL) != sizeof(resp)) {
+            log_msg("Failed to receive response from node %d\n", i);
+            retstat = -EIO;
+            goto cleanup;
+        }
+        
+        if (resp.status != 0) {
+            log_msg("Node %d returned error: %d\n", i, resp.error_code);
+            retstat = -resp.error_code;
+            goto cleanup;
+        }
+        
+        log_msg("Successfully wrote fragment %d to node %d\n", i, i);
+    }
+    
+    retstat = size;  // Return number of bytes written
+    
+cleanup:
+    for (int i = 0; i < num_nodes; i++) {
+        free(fragments[i]);
+    }
+    free(fragments);
+    
+    return retstat;
+}
+
+// Distributed read function with fault tolerance
+static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
+    struct bb_state* state = BB_DATA;
+    int num_nodes = state->num_nodes;
+    int num_data_fragments = num_nodes - 1;
+    
+    log_msg("\nmyfs_read: path=%s, size=%zu, offset=%ld, num_nodes=%d\n", 
+            path, size, offset, num_nodes);
+    
+    // Calculate fragment size
+    size_t fragment_size = (size + num_data_fragments - 1) / num_data_fragments;
+    
+    // Allocate buffers for fragments
+    char** fragments = (char**)malloc(num_nodes * sizeof(char*));
+    int* node_status = (int*)calloc(num_nodes, sizeof(int));  // 0=failed, 1=success
+    
+    for (int i = 0; i < num_nodes; i++) {
+        fragments[i] = (char*)calloc(fragment_size, 1);
+    }
+    
+    // Try to read from all nodes
+    for (int i = 0; i < num_nodes; i++) {
+        request_header_t req;
+        response_header_t resp;
+        
+        req.type = REQ_READ;
+        strncpy(req.filename, path + 1, sizeof(req.filename) - 1);  // Skip leading '/'
+        req.size = fragment_size;
+        req.offset = offset / num_data_fragments;
+        req.fragment_id = i;
+        
+        // Send request
+        if (send(state->nodes[i].socket_fd, &req, sizeof(req), 0) != sizeof(req)) {
+            log_msg("Failed to send read request to node %d\n", i);
+            node_status[i] = 0;
+            continue;
+        }
+        
+        // Receive response
+        if (recv(state->nodes[i].socket_fd, &resp, sizeof(resp), MSG_WAITALL) != sizeof(resp)) {
+            log_msg("Failed to receive response from node %d\n", i);
+            node_status[i] = 0;
+            continue;
+        }
+        
+        if (resp.status != 0) {
+            log_msg("Node %d returned error: %d\n", i, resp.error_code);
+            node_status[i] = 0;
+            continue;
+        }
+        
+        // Receive data
+        if (resp.size > 0) {
+            ssize_t received = recv(state->nodes[i].socket_fd, fragments[i], resp.size, MSG_WAITALL);
+            if (received != (ssize_t)resp.size) {
+                log_msg("Failed to receive data from node %d\n", i);
+                node_status[i] = 0;
+                continue;
+            }
+        }
+        
+        node_status[i] = 1;
+        log_msg("Successfully read fragment %d from node %d\n", i, i);
+    }
+    
+    // Count successful reads
+    int success_count = 0;
+    int failed_node = -1;
+    for (int i = 0; i < num_nodes; i++) {
+        if (node_status[i]) {
+            success_count++;
+        } else {
+            failed_node = i;
+        }
+    }
+    
+    log_msg("Successfully read from %d/%d nodes\n", success_count, num_nodes);
+    
+    // Need at least n-1 fragments to reconstruct data
+    if (success_count < num_data_fragments) {
+        log_msg("Not enough fragments to reconstruct data\n");
+        free(node_status);
+        for (int i = 0; i < num_nodes; i++) {
+            free(fragments[i]);
+        }
+        free(fragments);
+        return -EIO;
+    }
+    
+    // If one node failed, reconstruct its fragment using XOR
+    if (success_count == num_data_fragments && failed_node >= 0) {
+        log_msg("Reconstructing fragment %d using XOR\n", failed_node);
+        
+        // Start with all zeros
+        memset(fragments[failed_node], 0, fragment_size);
+        
+        // XOR all other fragments
+        for (int i = 0; i < num_nodes; i++) {
+            if (i != failed_node) {
+                xor_buffers(fragments[failed_node], fragments[i], fragment_size);
+            }
+        }
+        
+        log_msg("Successfully reconstructed fragment %d\n", failed_node);
+    }
+    
+    // Reconstruct original data from data fragments
+    memset(buf, 0, size);
+    for (size_t i = 0; i < size; i++) {
+        int frag_idx = (i / fragment_size) % num_data_fragments;
+        size_t pos = i % fragment_size;
+        buf[i] = fragments[frag_idx][pos];
+    }
+    
+    // Cleanup
+    free(node_status);
+    for (int i = 0; i < num_nodes; i++) {
+        free(fragments[i]);
+    }
+    free(fragments);
+    
+    return size;
 }
 
 ///////////////////////////////////////////////////////////
@@ -338,6 +616,12 @@ int bb_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_
     // no need to get fpath on this one, since I work from fi->fh not the path
     log_fi(fi);
 
+    // Use distributed read if nodes are configured
+    if (BB_DATA->num_nodes > 0) {
+        return myfs_read(path, buf, size, offset);
+    }
+    
+    // Fallback to local read
     return log_syscall("pread", pread(fi->fh, buf, size, offset), 0);
 }
 
@@ -362,6 +646,12 @@ int bb_write(const char *path, const char *buf, size_t size, off_t offset,
     // no need to get fpath on this one, since I work from fi->fh not the path
     log_fi(fi);
 
+    // Use distributed write if nodes are configured
+    if (BB_DATA->num_nodes > 0) {
+        return myfs_write(path, buf, size, offset);
+    }
+    
+    // Fallback to local write
     return log_syscall("pwrite", pwrite(fi->fh, buf, size, offset), 0);
 }
 
@@ -698,6 +988,16 @@ void *bb_init(struct fuse_conn_info *conn)
     log_conn(conn);
     log_fuse_context(fuse_get_context());
     
+    // Initialize connections to storage nodes
+    if (BB_DATA->num_nodes > 0) {
+        log_msg("Initializing connections to %d nodes\n", BB_DATA->num_nodes);
+        if (init_node_connections() < 0) {
+            fprintf(stderr, "Failed to initialize node connections\n");
+        } else {
+            log_msg("Successfully connected to all nodes\n");
+        }
+    }
+    
     return BB_DATA;
 }
 
@@ -864,7 +1164,10 @@ struct fuse_operations bb_oper = {
 
 void bb_usage()
 {
-    fprintf(stderr, "usage:  bbfs [FUSE and mount options] rootDir mountPoint\n");
+    fprintf(stderr, "usage:  bbfs [FUSE and mount options] rootDir mountPoint [host1:port1 host2:port2 ...]\n");
+    fprintf(stderr, "\nExample:\n");
+    fprintf(stderr, "  bbfs rootdir mountdir\n");
+    fprintf(stderr, "  bbfs rootdir mountdir 10.0.1.5:8001 10.0.1.6:8002 10.0.1.7:8003\n");
     abort();
 }
 
@@ -895,7 +1198,7 @@ int main(int argc, char *argv[])
     // start with a hyphen (this will break if you actually have a
     // rootpoint or mountpoint whose name starts with a hyphen, but so
     // will a zillion other programs)
-    if ((argc < 3) || (argv[argc-2][0] == '-') || (argv[argc-1][0] == '-'))
+    if (argc < 3)
 	bb_usage();
 
     bb_data = malloc(sizeof(struct bb_state));
@@ -903,20 +1206,94 @@ int main(int argc, char *argv[])
 	perror("main calloc");
 	abort();
     }
+    
+    // Initialize node count to 0
+    bb_data->num_nodes = 0;
 
-    // Pull the rootdir out of the argument list and save it in my
-    // internal data
-    bb_data->rootdir = realpath(argv[argc-2], NULL);
-    argv[argc-2] = argv[argc-1];
-    argv[argc-1] = NULL;
-    argc--;
+    // Find where node specifications start (after rootdir and mountpoint)
+    int node_start_idx = -1;
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] != '-' && i > 1) {
+            // This could be rootdir or mountpoint
+            if (node_start_idx == -1) {
+                node_start_idx = i;
+            } else if (i == node_start_idx + 1) {
+                // This is mountpoint
+                node_start_idx = i + 1;
+                break;
+            }
+        }
+    }
+    
+    // Parse node specifications (host:port format)
+    if (node_start_idx > 0 && node_start_idx < argc) {
+        for (int i = node_start_idx; i < argc && bb_data->num_nodes < MAX_NODES; i++) {
+            if (argv[i][0] == '-') continue;  // Skip options
+            
+            char* colon = strchr(argv[i], ':');
+            if (colon != NULL) {
+                // Parse host:port
+                size_t host_len = colon - argv[i];
+                if (host_len < sizeof(bb_data->nodes[0].host)) {
+                    strncpy(bb_data->nodes[bb_data->num_nodes].host, argv[i], host_len);
+                    bb_data->nodes[bb_data->num_nodes].host[host_len] = '\0';
+                    bb_data->nodes[bb_data->num_nodes].port = atoi(colon + 1);
+                    bb_data->nodes[bb_data->num_nodes].socket_fd = -1;
+                    
+                    fprintf(stderr, "Node %d: %s:%d\n", bb_data->num_nodes,
+                            bb_data->nodes[bb_data->num_nodes].host,
+                            bb_data->nodes[bb_data->num_nodes].port);
+                    
+                    bb_data->num_nodes++;
+                }
+            }
+        }
+    }
+    
+    fprintf(stderr, "Configured %d storage nodes\n", bb_data->num_nodes);
+    
+    // Find rootdir and mountpoint
+    int rootdir_idx = -1, mountpoint_idx = -1;
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] != '-' && strchr(argv[i], ':') == NULL) {
+            if (rootdir_idx == -1) {
+                rootdir_idx = i;
+            } else if (mountpoint_idx == -1) {
+                mountpoint_idx = i;
+                break;
+            }
+        }
+    }
+    
+    if (rootdir_idx == -1 || mountpoint_idx == -1) {
+        bb_usage();
+    }
+
+    // Pull the rootdir out of the argument list and save it in my internal data
+    bb_data->rootdir = realpath(argv[rootdir_idx], NULL);
+    
+    // Build new argv without node specifications
+    char** new_argv = malloc(argc * sizeof(char*));
+    int new_argc = 0;
+    new_argv[new_argc++] = argv[0];  // Program name
+    
+    // Copy FUSE options
+    for (int i = 1; i < argc; i++) {
+        if (i == rootdir_idx) continue;  // Skip rootdir (we'll add it back differently)
+        if (strchr(argv[i], ':') != NULL) continue;  // Skip node specs
+        new_argv[new_argc++] = argv[i];
+    }
+    
+    // Add mountpoint as last argument
+    new_argv[new_argc++] = argv[mountpoint_idx];
     
     bb_data->logfile = log_open();
     
     // turn over control to fuse
-    fprintf(stderr, "about to call fuse_main\n");
-    fuse_stat = fuse_main(argc, argv, &bb_oper, bb_data);
+    fprintf(stderr, "about to call fuse_main, rootdir=%s\n", bb_data->rootdir);
+    fuse_stat = fuse_main(new_argc, new_argv, &bb_oper, bb_data);
     fprintf(stderr, "fuse_main returned %d\n", fuse_stat);
     
+    free(new_argv);
     return fuse_stat;
 }

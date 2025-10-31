@@ -23,9 +23,21 @@
 // maintain bbfs state in here
 #include <limits.h>
 #include <stdio.h>
+
+#define MAX_NODES 10
+
+// Node information
+typedef struct {
+    char host[256];
+    int port;
+    int socket_fd;
+} node_info_t;
+
 struct bb_state {
     FILE *logfile;
     char *rootdir;
+    int num_nodes;              // Number of storage nodes
+    node_info_t nodes[MAX_NODES]; // Node information array
 };
 #define BB_DATA ((struct bb_state *) fuse_get_context()->private_data)
 
