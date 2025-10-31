@@ -105,19 +105,28 @@ static int connect_to_node(const char* host, int port) {
 static int init_node_connections() {
     struct bb_state* state = BB_DATA;
     
+    fprintf(stderr, "[MYFS] Initializing connections to %d storage nodes...\n", state->num_nodes);
+    log_msg("[MYFS] Initializing connections to %d storage nodes...\n", state->num_nodes);
+    
     for (int i = 0; i < state->num_nodes; i++) {
-        log_msg("Connecting to node %d: %s:%d\n", i, state->nodes[i].host, state->nodes[i].port);
+        fprintf(stderr, "[MYFS] Connecting to node %d: %s:%d\n", i, state->nodes[i].host, state->nodes[i].port);
+        log_msg("[MYFS] Connecting to node %d: %s:%d\n", i, state->nodes[i].host, state->nodes[i].port);
         
         state->nodes[i].socket_fd = connect_to_node(state->nodes[i].host, state->nodes[i].port);
         if (state->nodes[i].socket_fd < 0) {
-            fprintf(stderr, "Failed to connect to node %d (%s:%d)\n", 
+            fprintf(stderr, "[MYFS ERROR] Failed to connect to node %d (%s:%d)\n", 
+                    i, state->nodes[i].host, state->nodes[i].port);
+            log_msg("[MYFS ERROR] Failed to connect to node %d (%s:%d)\n", 
                     i, state->nodes[i].host, state->nodes[i].port);
             return -1;
         }
         
-        log_msg("Connected to node %d, socket fd=%d\n", i, state->nodes[i].socket_fd);
+        fprintf(stderr, "[MYFS] ✓ Connected to node %d, socket fd=%d\n", i, state->nodes[i].socket_fd);
+        log_msg("[MYFS] Connected to node %d, socket fd=%d\n", i, state->nodes[i].socket_fd);
     }
     
+    fprintf(stderr, "[MYFS] ✓ All nodes connected successfully!\n");
+    log_msg("[MYFS] All nodes connected successfully!\n");
     return 0;
 }
 
@@ -134,7 +143,9 @@ static int myfs_write(const char* path, const char* buf, size_t size, off_t offs
     int num_nodes = state->num_nodes;
     int num_data_fragments = num_nodes - 1;  // n-1 data fragments
     
-    log_msg("\nmyfs_write: path=%s, size=%zu, offset=%ld, num_nodes=%d\n", 
+    fprintf(stderr, "[MYFS WRITE] path=%s, size=%zu, offset=%ld, nodes=%d\n", 
+            path, size, offset, num_nodes);
+    log_msg("\n[MYFS WRITE] path=%s, size=%zu, offset=%ld, num_nodes=%d\n", 
             path, size, offset, num_nodes);
     
     // Calculate fragment size (divide data among n-1 nodes)
@@ -193,14 +204,17 @@ static int myfs_write(const char* path, const char* buf, size_t size, off_t offs
         }
         
         if (resp.status != 0) {
-            log_msg("Node %d returned error: %d\n", i, resp.error_code);
+            fprintf(stderr, "[MYFS WRITE ERROR] Node %d returned error: %d\n", i, resp.error_code);
+            log_msg("[MYFS WRITE ERROR] Node %d returned error: %d\n", i, resp.error_code);
             retstat = -resp.error_code;
             goto cleanup;
         }
         
-        log_msg("Successfully wrote fragment %d to node %d\n", i, i);
+        fprintf(stderr, "[MYFS WRITE] ✓ Fragment %d written to node %d (%zu bytes)\n", i, i, fragment_size);
+        log_msg("[MYFS WRITE] Successfully wrote fragment %d to node %d\n", i, i);
     }
     
+    fprintf(stderr, "[MYFS WRITE] ✓ Write complete: %zu bytes\n", size);
     retstat = size;  // Return number of bytes written
     
 cleanup:
@@ -218,7 +232,9 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
     int num_nodes = state->num_nodes;
     int num_data_fragments = num_nodes - 1;
     
-    log_msg("\nmyfs_read: path=%s, size=%zu, offset=%ld, num_nodes=%d\n", 
+    fprintf(stderr, "[MYFS READ] path=%s, size=%zu, offset=%ld, nodes=%d\n", 
+            path, size, offset, num_nodes);
+    log_msg("\n[MYFS READ] path=%s, size=%zu, offset=%ld, num_nodes=%d\n", 
             path, size, offset, num_nodes);
     
     // Calculate fragment size
@@ -288,11 +304,13 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         }
     }
     
-    log_msg("Successfully read from %d/%d nodes\n", success_count, num_nodes);
+    fprintf(stderr, "[MYFS READ] Successfully read from %d/%d nodes\n", success_count, num_nodes);
+    log_msg("[MYFS READ] Successfully read from %d/%d nodes\n", success_count, num_nodes);
     
     // Need at least n-1 fragments to reconstruct data
     if (success_count < num_data_fragments) {
-        log_msg("Not enough fragments to reconstruct data\n");
+        fprintf(stderr, "[MYFS READ ERROR] Not enough fragments to reconstruct data\n");
+        log_msg("[MYFS READ ERROR] Not enough fragments to reconstruct data\n");
         free(node_status);
         for (int i = 0; i < num_nodes; i++) {
             free(fragments[i]);
@@ -303,7 +321,8 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
     
     // If one node failed, reconstruct its fragment using XOR
     if (success_count == num_data_fragments && failed_node >= 0) {
-        log_msg("Reconstructing fragment %d using XOR\n", failed_node);
+        fprintf(stderr, "[MYFS READ] ⚠ Node %d failed, reconstructing using XOR...\n", failed_node);
+        log_msg("[MYFS READ] Reconstructing fragment %d using XOR\n", failed_node);
         
         // Start with all zeros
         memset(fragments[failed_node], 0, fragment_size);
@@ -315,7 +334,8 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
             }
         }
         
-        log_msg("Successfully reconstructed fragment %d\n", failed_node);
+        fprintf(stderr, "[MYFS READ] ✓ Fragment %d reconstructed successfully\n", failed_node);
+        log_msg("[MYFS READ] Successfully reconstructed fragment %d\n", failed_node);
     }
     
     // Reconstruct original data from data fragments
@@ -325,6 +345,8 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         size_t pos = i % fragment_size;
         buf[i] = fragments[frag_idx][pos];
     }
+    
+    fprintf(stderr, "[MYFS READ] ✓ Read complete: %zu bytes\n", size);
     
     // Cleanup
     free(node_status);
@@ -1277,15 +1299,12 @@ int main(int argc, char *argv[])
     int new_argc = 0;
     new_argv[new_argc++] = argv[0];  // Program name
     
-    // Copy FUSE options
+    // Copy FUSE options and mountpoint (but skip rootdir and node specs)
     for (int i = 1; i < argc; i++) {
-        if (i == rootdir_idx) continue;  // Skip rootdir (we'll add it back differently)
+        if (i == rootdir_idx) continue;  // Skip rootdir (we'll handle it separately)
         if (strchr(argv[i], ':') != NULL) continue;  // Skip node specs
         new_argv[new_argc++] = argv[i];
     }
-    
-    // Add mountpoint as last argument
-    new_argv[new_argc++] = argv[mountpoint_idx];
     
     bb_data->logfile = log_open();
     
