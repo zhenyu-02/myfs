@@ -268,7 +268,7 @@ static int myfs_write(const char* path, const char* buf, size_t size, off_t offs
         req.type = REQ_WRITE;
         strncpy(req.filename, path + 1, sizeof(req.filename) - 1);  // Skip leading '/'
         req.size = fragment_size;
-        req.offset = offset / num_data_fragments;  // Adjust offset for fragment
+        req.offset = 0;  // Always write from start of fragment file (for simplicity)
         req.fragment_id = i;
         
         fprintf(stderr, "[MYFS WRITE] Node %d: Sending header (file=%s, frag=%u, size=%zu, offset=%ld)...\n",
@@ -364,10 +364,41 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
     log_msg("\n[MYFS READ] path=%s, size=%zu, offset=%ld, num_nodes=%d\n", 
             path, size, offset, num_nodes);
     
-    // Calculate fragment size
-    size_t fragment_size = (size + num_data_fragments - 1) / num_data_fragments;
-    fprintf(stderr, "[MYFS READ] Fragment size: %zu bytes (size=%zu, fragments=%d)\n", 
-            fragment_size, size, num_data_fragments);
+    // CRITICAL: Get actual file size from metadata file
+    // The 'size' parameter from FUSE may be larger (e.g., 4096), but we need
+    // to use the actual file size to calculate the correct fragment_size
+    char fpath[PATH_MAX];
+    snprintf(fpath, PATH_MAX, "%s%s", state->rootdir, path);
+    
+    struct stat st;
+    if (stat(fpath, &st) < 0) {
+        fprintf(stderr, "[MYFS READ ERROR] Cannot stat file: %s\n", strerror(errno));
+        log_msg("[MYFS READ ERROR] Cannot stat file %s: %s\n", fpath, strerror(errno));
+        return -errno;
+    }
+    
+    size_t file_size = st.st_size;
+    fprintf(stderr, "[MYFS READ] File actual size: %zu bytes (requested: %zu bytes)\n", 
+            file_size, size);
+    log_msg("[MYFS READ] File actual size: %zu bytes (requested: %zu bytes)\n", 
+            file_size, size);
+    
+    // Limit read size to actual file size
+    if (offset >= (off_t)file_size) {
+        fprintf(stderr, "[MYFS READ] Offset %ld >= file size %zu, returning 0\n", offset, file_size);
+        return 0;  // EOF
+    }
+    
+    size_t bytes_to_read = size;
+    if (offset + size > file_size) {
+        bytes_to_read = file_size - offset;
+        fprintf(stderr, "[MYFS READ] Adjusted read size to %zu bytes (EOF)\n", bytes_to_read);
+    }
+    
+    // Calculate fragment size based on ACTUAL FILE SIZE, not requested size
+    size_t fragment_size = (file_size + num_data_fragments - 1) / num_data_fragments;
+    fprintf(stderr, "[MYFS READ] Fragment size: %zu bytes (file_size=%zu, fragments=%d)\n", 
+            fragment_size, file_size, num_data_fragments);
     
     // Allocate buffers for fragments
     fprintf(stderr, "[MYFS READ] Allocating memory: %d fragments × %zu bytes = %zu bytes total\n",
@@ -417,7 +448,7 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         req.type = REQ_READ;
         strncpy(req.filename, path + 1, sizeof(req.filename) - 1);  // Skip leading '/'
         req.size = fragment_size;
-        req.offset = offset / num_data_fragments;
+        req.offset = 0;  // Always read from start of fragment file
         req.fragment_id = i;
         
         fprintf(stderr, "[MYFS READ] Node %d: Sending read request (file=%s, frag=%u, size=%zu, offset=%ld)...\n",
@@ -529,14 +560,20 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
     }
     
     // Reconstruct original data from data fragments
-    memset(buf, 0, size);
-    for (size_t i = 0; i < size; i++) {
-        int frag_idx = (i / fragment_size) % num_data_fragments;
-        size_t pos = i % fragment_size;
+    // Only reconstruct the portion we actually need to read
+    memset(buf, 0, bytes_to_read);
+    
+    // Handle offset: we need to skip the first 'offset' bytes
+    for (size_t i = 0; i < bytes_to_read; i++) {
+        size_t file_pos = offset + i;  // Position in the original file
+        int frag_idx = (file_pos / fragment_size) % num_data_fragments;
+        size_t pos = file_pos % fragment_size;
         buf[i] = fragments[frag_idx][pos];
     }
     
-    fprintf(stderr, "[MYFS READ] ✓ Read complete: %zu bytes\n", size);
+    fprintf(stderr, "[MYFS READ] ✓ Read complete: %zu bytes (requested %zu, file_size %zu)\n", 
+            bytes_to_read, size, file_size);
+    log_msg("[MYFS READ] Reconstructed %zu bytes\n", bytes_to_read);
     
     // Cleanup
     free(node_status);
@@ -545,7 +582,7 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
     }
     free(fragments);
     
-    return size;
+    return bytes_to_read;  // Return actual bytes read, not requested size
 }
 
 ///////////////////////////////////////////////////////////
