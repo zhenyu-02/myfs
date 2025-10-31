@@ -134,8 +134,18 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "Restarting node 2 (needed for write operations)..."
     cd $MYFS_DIR
     ./src/server 8002 ~/storage_node2 &
-    echo "  Server 2 (port 8002) restarted, PID=$!"
-    sleep 2
+    SERVER_PID=$!
+    echo "  Server 2 (port 8002) restarted, PID=$SERVER_PID"
+    echo "  Waiting for server to fully start..."
+    sleep 3
+    
+    # Verify server is running
+    if ps -p $SERVER_PID > /dev/null; then
+        echo "  ✓ Server is running"
+    else
+        echo "  ✗ Server failed to start"
+        exit 1
+    fi
     
     echo "Creating 4 MB file..."
     dd if=/dev/urandom of=/tmp/4mb.dat bs=1M count=4 2>/dev/null

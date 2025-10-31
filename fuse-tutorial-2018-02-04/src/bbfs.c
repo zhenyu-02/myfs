@@ -120,6 +120,40 @@ static int connect_to_node(const char* host, int port) {
     return sock;
 }
 
+// Reconnect to a specific node
+static int reconnect_to_node(int node_id) {
+    struct bb_state* state = BB_DATA;
+    
+    if (node_id < 0 || node_id >= state->num_nodes) {
+        return -1;
+    }
+    
+    fprintf(stderr, "[MYFS] Attempting to reconnect to node %d (%s:%d)...\n",
+            node_id, state->nodes[node_id].host, state->nodes[node_id].port);
+    log_msg("[MYFS] Reconnecting to node %d\n", node_id);
+    
+    // Close old socket if still open
+    if (state->nodes[node_id].socket_fd >= 0) {
+        close(state->nodes[node_id].socket_fd);
+        state->nodes[node_id].socket_fd = -1;
+    }
+    
+    // Try to reconnect
+    state->nodes[node_id].socket_fd = connect_to_node(state->nodes[node_id].host, 
+                                                       state->nodes[node_id].port);
+    if (state->nodes[node_id].socket_fd < 0) {
+        fprintf(stderr, "[MYFS] ✗ Reconnection to node %d failed\n", node_id);
+        log_msg("[MYFS] Reconnection to node %d failed\n", node_id);
+        return -1;
+    }
+    
+    fprintf(stderr, "[MYFS] ✓ Reconnected to node %d, new socket fd=%d\n", 
+            node_id, state->nodes[node_id].socket_fd);
+    log_msg("[MYFS] Reconnected to node %d, socket fd=%d\n", 
+            node_id, state->nodes[node_id].socket_fd);
+    return 0;
+}
+
 // Initialize connections to all nodes
 static int init_node_connections() {
     struct bb_state* state = BB_DATA;
@@ -240,9 +274,27 @@ static int myfs_write(const char* path, const char* buf, size_t size, off_t offs
         fprintf(stderr, "[MYFS WRITE] Node %d: Sending header (file=%s, frag=%u, size=%zu, offset=%ld)...\n",
                 i, req.filename, req.fragment_id, req.size, req.offset);
         
-        // Send request header
-        if (send_all(state->nodes[i].socket_fd, &req, sizeof(req)) != sizeof(req)) {
-            fprintf(stderr, "[MYFS WRITE ERROR] Failed to send request header to node %d\n", i);
+        // Send request header (with retry on connection failure)
+        int send_success = 0;
+        for (int retry = 0; retry < 2; retry++) {
+            if (send_all(state->nodes[i].socket_fd, &req, sizeof(req)) == sizeof(req)) {
+                send_success = 1;
+                break;
+            }
+            
+            // Send failed, try to reconnect
+            if (retry == 0) {
+                fprintf(stderr, "[MYFS WRITE] ⚠ Node %d: Send header failed, attempting reconnect...\n", i);
+                if (reconnect_to_node(i) < 0) {
+                    fprintf(stderr, "[MYFS WRITE ERROR] Node %d: Reconnect failed\n", i);
+                    break;
+                }
+                // Retry with new connection
+            }
+        }
+        
+        if (!send_success) {
+            fprintf(stderr, "[MYFS WRITE ERROR] Failed to send request header to node %d after retry\n", i);
             log_msg("Failed to send request to node %d\n", i);
             retstat = -EIO;
             goto cleanup;
@@ -371,9 +423,27 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         fprintf(stderr, "[MYFS READ] Node %d: Sending read request (file=%s, frag=%u, size=%zu, offset=%ld)...\n",
                 i, req.filename, req.fragment_id, req.size, req.offset);
         
-        // Send request
-        if (send_all(state->nodes[i].socket_fd, &req, sizeof(req)) != sizeof(req)) {
-            fprintf(stderr, "[MYFS READ] ✗ Node %d: Failed to send request\n", i);
+        // Send request (with retry on connection failure)
+        int send_success = 0;
+        for (int retry = 0; retry < 2; retry++) {
+            if (send_all(state->nodes[i].socket_fd, &req, sizeof(req)) == sizeof(req)) {
+                send_success = 1;
+                break;
+            }
+            
+            // Send failed, try to reconnect
+            if (retry == 0) {
+                fprintf(stderr, "[MYFS READ] ⚠ Node %d: Send request failed, attempting reconnect...\n", i);
+                if (reconnect_to_node(i) < 0) {
+                    fprintf(stderr, "[MYFS READ] ✗ Node %d: Reconnect failed\n", i);
+                    break;
+                }
+                // Retry with new connection
+            }
+        }
+        
+        if (!send_success) {
+            fprintf(stderr, "[MYFS READ] ✗ Node %d: Failed to send request after retry\n", i);
             log_msg("Failed to send read request to node %d\n", i);
             node_status[i] = 0;
             continue;

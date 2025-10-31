@@ -89,7 +89,10 @@ echo -e "\nTest 4: 4 MB file"
 echo "Restarting node 2 (needed for write operations)..."
 cd $MYFS_DIR
 ./src/server 8002 ~/storage_node2 &
-sleep 2
+SERVER_PID=$!
+echo "Server 2 restarted, PID=$SERVER_PID"
+echo "Waiting for server to fully start..."
+sleep 3
 echo "Creating 4 MB file..."
 dd if=/dev/urandom of=/tmp/4mb.dat bs=1M count=4 2>/dev/null
 echo "Copying to MYFS..."
