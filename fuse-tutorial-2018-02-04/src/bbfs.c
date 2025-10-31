@@ -860,7 +860,31 @@ int bb_write(const char *path, const char *buf, size_t size, off_t offset,
 
     // Use distributed write if nodes are configured
     if (BB_DATA->num_nodes > 0) {
-        return myfs_write(path, buf, size, offset);
+        retstat = myfs_write(path, buf, size, offset);
+        
+        // CRITICAL: Update local metadata file size after successful write
+        // This ensures getattr() returns the correct file size for subsequent reads
+        if (retstat > 0 && fi->fh > 0) {
+            off_t new_size = offset + retstat;
+            struct stat st;
+            
+            // Get current file size
+            if (fstat(fi->fh, &st) == 0) {
+                // Only extend file if new write goes beyond current size
+                if (st.st_size < new_size) {
+                    if (ftruncate(fi->fh, new_size) == 0) {
+                        log_msg("[MYFS] Updated local metadata file size: %lld -> %lld bytes\n", 
+                                st.st_size, new_size);
+                        fprintf(stderr, "[MYFS] ✓ Updated metadata file size to %lld bytes\n", new_size);
+                    } else {
+                        log_msg("[MYFS ERROR] Failed to update file size: %s\n", strerror(errno));
+                        fprintf(stderr, "[MYFS ERROR] Failed to update metadata file size\n");
+                    }
+                }
+            }
+        }
+        
+        return retstat;
     }
     
     // Fallback to local write

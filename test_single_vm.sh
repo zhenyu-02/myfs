@@ -180,6 +180,13 @@ else
     echo -e "\n✗ 读回内容不匹配！"
     echo "  期望: $TEST_CONTENT"
     echo "  实际: $READ_CONTENT"
+    echo ""
+    echo "调试信息："
+    echo "  查看节点1数据: cat ~/storage_node1/test.txt.frag0"
+    echo "  查看节点2数据: cat ~/storage_node2/test.txt.frag1"
+    echo "  查看节点3数据: cat ~/storage_node3/test.txt.frag2"
+    echo "  查看MYFS日志: tail -50 ~/myfs-zy/fuse-tutorial-2018-02-04/bbfs.log"
+    echo "  查看挂载日志: tail -50 /tmp/myfs_mount.log"
     exit 1
 fi
 
@@ -240,6 +247,13 @@ else
     echo "✗ MD5校验失败！"
     echo "  原始: $ORIGINAL_MD5"
     echo "  读回: $READ_MD5"
+    echo ""
+    echo "调试信息："
+    echo "  查看节点文件列表: ls -lh ~/storage_node{1,2,3}/"
+    echo "  查看最新片段: ls -lht ~/storage_node1/ | head -5"
+    echo "  查看MYFS日志: tail -100 ~/myfs-zy/fuse-tutorial-2018-02-04/bbfs.log"
+    echo "  查看挂载日志: tail -100 /tmp/myfs_mount.log"
+    echo "  对比原始文件: md5sum /tmp/1mb.dat ~/myfs_mount/1mb.dat"
     exit 1
 fi
 
@@ -292,6 +306,13 @@ RECOVERED_TEST_MD5=$(md5sum ~/myfs_mount/test.txt 2>/dev/null | awk '{print $1}'
 
 if [ -z "$RECOVERED_TEST_MD5" ]; then
     echo "✗ 读取失败！容错机制未生效"
+    echo ""
+    echo "调试信息："
+    echo "  查看MYFS日志: tail -50 ~/myfs-zy/fuse-tutorial-2018-02-04/bbfs.log"
+    echo "  查看挂载日志: tail -50 /tmp/myfs_mount.log"
+    echo "  查看存活节点: ps aux | grep '[s]erver 800'"
+    echo "  查看Node 1片段: cat ~/storage_node1/test.txt.frag0"
+    echo "  查看Node 3片段: xxd ~/storage_node3/test.txt.frag2 | head -5"
     tail -30 /tmp/myfs_mount.log
     exit 1
 fi
@@ -302,6 +323,12 @@ else
     echo "✗ XOR恢复的数据不正确！"
     echo "  原始: $ORIGINAL_TEST_MD5"
     echo "  恢复: $RECOVERED_TEST_MD5"
+    echo ""
+    echo "调试信息："
+    echo "  查看恢复的内容: cat ~/myfs_mount/test.txt | hexdump -C | head -5"
+    echo "  查看Node 1片段: cat ~/storage_node1/test.txt.frag0"
+    echo "  查看Node 3片段: xxd ~/storage_node3/test.txt.frag2 | head -5"
+    echo "  查看MYFS日志: tail -50 ~/myfs-zy/fuse-tutorial-2018-02-04/bbfs.log"
     exit 1
 fi
 
@@ -315,6 +342,12 @@ else
     echo "✗ 大文件XOR恢复失败！"
     echo "  原始: $ORIGINAL_1MB_MD5"
     echo "  恢复: $RECOVERED_1MB_MD5"
+    echo ""
+    echo "调试信息："
+    echo "  查看片段大小: ls -lh ~/storage_node{1,3}/1mb.dat.frag*"
+    echo "  验证原始文件: md5sum /tmp/1mb.dat"
+    echo "  验证恢复文件: md5sum ~/myfs_mount/1mb.dat"
+    echo "  查看MYFS日志: tail -100 ~/myfs-zy/fuse-tutorial-2018-02-04/bbfs.log | grep -A 5 'MYFS READ'"
     exit 1
 fi
 
