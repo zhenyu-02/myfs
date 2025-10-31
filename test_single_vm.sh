@@ -76,8 +76,21 @@ ls -lh ~/storage_node2/
 echo "Node 3 files (parity):"
 ls -lh ~/storage_node3/
 
-# Test 3: 4 MB 文件
-echo -e "\nTest 3: 4 MB file"
+# Test 3: 容错测试
+echo -e "\nTest 3: Fault tolerance"
+echo "Stopping node 2..."
+pkill -f "server 8002"
+sleep 1
+echo "Trying to read test.txt (should succeed with XOR recovery)..."
+cat ~/myfs_mount/test.txt && echo "✓ Fault tolerance test passed"
+
+# Test 4: 4 MB 文件（重启node 2后）
+echo -e "\nTest 4: 4 MB file"
+echo "Restarting node 2 (needed for write operations)..."
+cd $MYFS_DIR
+./src/server 8002 ~/storage_node2 &
+sleep 2
+echo "Creating 4 MB file..."
 dd if=/dev/urandom of=/tmp/4mb.dat bs=1M count=4 2>/dev/null
 cp /tmp/4mb.dat ~/myfs_mount/
 cat ~/myfs_mount/4mb.dat > /dev/null && echo "✓ 4 MB file test passed"
@@ -90,14 +103,6 @@ echo "Node 2:"
 ls -lh ~/storage_node2/
 echo "Node 3 (parity):"
 ls -lh ~/storage_node3/
-
-# Test 4: 容错测试
-echo -e "\nTest 4: Fault tolerance"
-echo "Stopping node 2..."
-pkill -f "server 8002"
-sleep 1
-echo "Trying to read test.txt (should succeed with XOR recovery)..."
-cat ~/myfs_mount/test.txt && echo "✓ Fault tolerance test passed"
 
 echo -e "\n=========================================="
 echo "All tests completed!"

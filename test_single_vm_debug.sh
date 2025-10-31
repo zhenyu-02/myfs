@@ -131,6 +131,12 @@ cat ~/myfs_mount/1mb.dat > /dev/null && echo "✓ Large file read with fault tol
 read -p $'\n[Test 4] Run 4 MB file test? (y/n) ' -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo "Restarting node 2 (needed for write operations)..."
+    cd $MYFS_DIR
+    ./src/server 8002 ~/storage_node2 &
+    echo "  Server 2 (port 8002) restarted, PID=$!"
+    sleep 2
+    
     echo "Creating 4 MB file..."
     dd if=/dev/urandom of=/tmp/4mb.dat bs=1M count=4 2>/dev/null
     echo "Writing to MYFS..."
@@ -142,8 +148,8 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo -e "\n[Test 4 - Check Fragments]"
     echo "Node 1 files:"
     ls -lh ~/storage_node1/ | grep -v "^total"
-    echo "Node 2 files (OFFLINE):"
-    echo "  Node 2 is offline"
+    echo "Node 2 files:"
+    ls -lh ~/storage_node2/ | grep -v "^total"
     echo "Node 3 files (parity):"
     ls -lh ~/storage_node3/ | grep -v "^total"
 fi
