@@ -1423,19 +1423,22 @@ int main(int argc, char *argv[])
     bb_data->num_nodes = 0;
 
     // Find where node specifications start (after rootdir and mountpoint)
+    // We expect: bbfs [options] rootdir mountpoint node1 node2 ...
     int node_start_idx = -1;
+    int non_option_count = 0;
     for (int i = 1; i < argc; i++) {
-        if (argv[i][0] != '-' && i > 1) {
-            // This could be rootdir or mountpoint
-            if (node_start_idx == -1) {
-                node_start_idx = i;
-            } else if (i == node_start_idx + 1) {
-                // This is mountpoint
+        if (argv[i][0] != '-' && strchr(argv[i], ':') == NULL) {
+            // This is rootdir or mountpoint (no colon means not a node spec)
+            non_option_count++;
+            if (non_option_count == 2) {
+                // After rootdir and mountpoint, nodes start
                 node_start_idx = i + 1;
                 break;
             }
         }
     }
+    
+    fprintf(stderr, "[MYFS] Parsed arguments: node_start_idx=%d\n", node_start_idx);
     
     // Parse node specifications (host:port format)
     if (node_start_idx > 0 && node_start_idx < argc) {
