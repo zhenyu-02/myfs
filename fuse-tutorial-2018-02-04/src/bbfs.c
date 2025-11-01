@@ -662,9 +662,12 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
             file_size, should_cache ? "CACHE" : "NO_CACHE (>3MB)");
     log_msg("[MYFS READ] File %s: size=%zu, will_cache=%d\n", path, file_size, should_cache);
     
+    // Declare cache variable here so it's available throughout the function
+    read_cache_t* cache = NULL;
+    
     // Only check cache for small files
     if (should_cache) {
-        read_cache_t* cache = get_read_cache(path, 0);
+        cache = get_read_cache(path, 0);
         if (cache && cache->buffer && cache->size == file_size) {
             // Verify that the read is within cache bounds
             if (offset + bytes_to_read <= cache->size) {
