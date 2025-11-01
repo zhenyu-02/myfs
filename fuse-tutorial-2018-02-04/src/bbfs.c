@@ -651,12 +651,31 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
     // Check read cache first
     read_cache_t* cache = get_read_cache(path, 0);
     if (cache && cache->buffer && cache->size == file_size) {
+<<<<<<< Current (Your changes)
         // Cache hit! Just copy from cache
         fprintf(stderr, "[MYFS READ CACHE HIT] Serving %zu bytes from cache (offset=%ld)\n", 
                 bytes_to_read, offset);
         log_msg("[MYFS READ CACHE HIT] path=%s, offset=%ld, size=%zu\n", path, offset, bytes_to_read);
         memcpy(buf, cache->buffer + offset, bytes_to_read);
         return bytes_to_read;
+=======
+        // Verify that the read is within cache bounds
+        if (offset + bytes_to_read <= cache->size) {
+            // Cache hit! Just copy from cache
+            fprintf(stderr, "[MYFS READ CACHE HIT] Serving %zu bytes from cache (offset=%ld)\n", 
+                    bytes_to_read, offset);
+            log_msg("[MYFS READ CACHE HIT] path=%s, offset=%ld, size=%zu\n", path, offset, bytes_to_read);
+            memcpy(buf, cache->buffer + offset, bytes_to_read);
+            return bytes_to_read;
+        } else {
+            // Read request exceeds cache bounds - this shouldn't happen
+            fprintf(stderr, "[MYFS READ WARNING] Cache bounds exceeded: offset=%ld, bytes_to_read=%zu, cache_size=%zu\n",
+                    offset, bytes_to_read, cache->size);
+            log_msg("[MYFS READ WARNING] Cache bounds check failed, invalidating cache\n");
+            // Invalidate cache and fall through to network read
+            invalidate_read_cache(path);
+        }
+>>>>>>> Incoming (Background Agent changes)
     }
     
     // Cache miss - need to read from network
