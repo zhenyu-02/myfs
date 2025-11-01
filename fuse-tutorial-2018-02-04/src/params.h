@@ -23,6 +23,7 @@
 // maintain bbfs state in here
 #include <limits.h>
 #include <stdio.h>
+#include <pthread.h>
 
 #define MAX_NODES 10
 
@@ -31,6 +32,7 @@ typedef struct {
     char host[256];
     int port;
     int socket_fd;
+    pthread_mutex_t socket_mutex;  // Mutex for thread-safe socket access
 } node_info_t;
 
 struct bb_state {
@@ -38,6 +40,7 @@ struct bb_state {
     char *rootdir;
     int num_nodes;              // Number of storage nodes
     node_info_t nodes[MAX_NODES]; // Node information array
+    pthread_mutex_t nodes_mutex;    // Global mutex for nodes operations
 };
 #define BB_DATA ((struct bb_state *) fuse_get_context()->private_data)
 

@@ -165,6 +165,9 @@ static int init_node_connections() {
         fprintf(stderr, "[MYFS] Connecting to node %d: %s:%d\n", i, state->nodes[i].host, state->nodes[i].port);
         log_msg("[MYFS] Connecting to node %d: %s:%d\n", i, state->nodes[i].host, state->nodes[i].port);
         
+        // Initialize mutex for this node's socket
+        pthread_mutex_init(&state->nodes[i].socket_mutex, NULL);
+        
         state->nodes[i].socket_fd = connect_to_node(state->nodes[i].host, state->nodes[i].port);
         if (state->nodes[i].socket_fd < 0) {
             fprintf(stderr, "[MYFS ERROR] Failed to connect to node %d (%s:%d)\n", 
@@ -351,6 +354,9 @@ static int myfs_flush_write_buffer(const char* path) {
         fprintf(stderr, "[MYFS FLUSH] Node %d: Sending header (file=%s, frag=%u, size=%zu, offset=%ld)...\n",
                 i, req.filename, req.fragment_id, req.size, req.offset);
         
+        // Lock mutex for thread-safe socket access
+        pthread_mutex_lock(&state->nodes[i].socket_mutex);
+        
         // Send request header (with retry on connection failure)
         int send_success = 0;
         for (int retry = 0; retry < 2; retry++) {
@@ -371,6 +377,7 @@ static int myfs_flush_write_buffer(const char* path) {
         }
         
         if (!send_success) {
+            pthread_mutex_unlock(&state->nodes[i].socket_mutex);
             fprintf(stderr, "[MYFS FLUSH ERROR] Failed to send request header to node %d after retry\n", i);
             log_msg("Failed to send request to node %d\n", i);
             retstat = -EIO;
@@ -381,6 +388,7 @@ static int myfs_flush_write_buffer(const char* path) {
         
         // Send data
         if (send_all(state->nodes[i].socket_fd, fragments[i], fragment_size) != (ssize_t)fragment_size) {
+            pthread_mutex_unlock(&state->nodes[i].socket_mutex);
             fprintf(stderr, "[MYFS FLUSH ERROR] Failed to send data to node %d\n", i);
             log_msg("Failed to send data to node %d\n", i);
             retstat = -EIO;
@@ -391,6 +399,7 @@ static int myfs_flush_write_buffer(const char* path) {
         
         // Receive response
         if (recv(state->nodes[i].socket_fd, &resp, sizeof(resp), MSG_WAITALL) != sizeof(resp)) {
+            pthread_mutex_unlock(&state->nodes[i].socket_mutex);
             fprintf(stderr, "[MYFS FLUSH ERROR] Failed to receive response from node %d\n", i);
             log_msg("Failed to receive response from node %d\n", i);
             retstat = -EIO;
@@ -398,12 +407,16 @@ static int myfs_flush_write_buffer(const char* path) {
         }
         
         if (resp.status != 0) {
+            pthread_mutex_unlock(&state->nodes[i].socket_mutex);
             fprintf(stderr, "[MYFS FLUSH ERROR] Node %d returned error: status=%d, errno=%d\n", 
                     i, resp.status, resp.error_code);
             log_msg("[MYFS FLUSH ERROR] Node %d returned error: %d\n", i, resp.error_code);
             retstat = -resp.error_code;
             goto cleanup;
         }
+        
+        // Unlock mutex after successful communication
+        pthread_mutex_unlock(&state->nodes[i].socket_mutex);
         
         fprintf(stderr, "[MYFS FLUSH] ✓ Node %d: Fragment %d written successfully (%zu bytes)\n", 
                 i, i, fragment_size);
@@ -537,6 +550,9 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         fprintf(stderr, "[MYFS READ] Node %d: Sending read request (file=%s, frag=%u, size=%zu, offset=%ld)...\n",
                 i, req.filename, req.fragment_id, req.size, req.offset);
         
+        // Lock mutex for thread-safe socket access
+        pthread_mutex_lock(&state->nodes[i].socket_mutex);
+        
         // Send request (with retry on connection failure)
         int send_success = 0;
         for (int retry = 0; retry < 2; retry++) {
@@ -557,6 +573,7 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         }
         
         if (!send_success) {
+            pthread_mutex_unlock(&state->nodes[i].socket_mutex);
             fprintf(stderr, "[MYFS READ] ✗ Node %d: Failed to send request after retry\n", i);
             log_msg("Failed to send read request to node %d\n", i);
             node_status[i] = 0;
@@ -565,6 +582,7 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         
         // Receive response
         if (recv(state->nodes[i].socket_fd, &resp, sizeof(resp), MSG_WAITALL) != sizeof(resp)) {
+            pthread_mutex_unlock(&state->nodes[i].socket_mutex);
             fprintf(stderr, "[MYFS READ] ✗ Node %d: Failed to receive response (connection lost)\n", i);
             log_msg("Failed to receive response from node %d\n", i);
             node_status[i] = 0;
@@ -572,6 +590,7 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         }
         
         if (resp.status != 0) {
+            pthread_mutex_unlock(&state->nodes[i].socket_mutex);
             fprintf(stderr, "[MYFS READ] ✗ Node %d: Server returned error: status=%d, errno=%d\n", 
                     i, resp.status, resp.error_code);
             log_msg("Node %d returned error: status=%d, errno=%d\n", i, resp.status, resp.error_code);
@@ -585,12 +604,14 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
             ssize_t received = recv(state->nodes[i].socket_fd, fragments[i], resp.size, MSG_WAITALL);
             if (received < 0) {
                 // recv error
+                pthread_mutex_unlock(&state->nodes[i].socket_mutex);
                 fprintf(stderr, "[MYFS READ] ✗ Node %d: recv error: %s\n", i, strerror(errno));
                 log_msg("Failed to receive data from node %d: %s\n", i, strerror(errno));
                 node_status[i] = 0;
                 continue;
             } else if (received != (ssize_t)resp.size) {
                 // Partial recv - connection might be broken
+                pthread_mutex_unlock(&state->nodes[i].socket_mutex);
                 fprintf(stderr, "[MYFS READ] ✗ Node %d: Partial data received (expected %zu, got %zd)\n", 
                         i, resp.size, received);
                 log_msg("Failed to receive data from node %d (partial)\n", i);
@@ -598,6 +619,9 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
                 continue;
             }
         }
+        
+        // Unlock mutex after successful communication
+        pthread_mutex_unlock(&state->nodes[i].socket_mutex);
         
         node_status[i] = 1;
         fprintf(stderr, "[MYFS READ] ✓ Node %d: Fragment read successfully (%zu bytes)\n", i, resp.size);
@@ -1392,6 +1416,18 @@ void *bb_init(struct fuse_conn_info *conn)
 void bb_destroy(void *userdata)
 {
     log_msg("\nbb_destroy(userdata=0x%08x)\n", userdata);
+    
+    struct bb_state* state = (struct bb_state*)userdata;
+    if (state && state->num_nodes > 0) {
+        // Clean up mutexes
+        for (int i = 0; i < state->num_nodes; i++) {
+            pthread_mutex_destroy(&state->nodes[i].socket_mutex);
+            if (state->nodes[i].socket_fd >= 0) {
+                close(state->nodes[i].socket_fd);
+            }
+        }
+        pthread_mutex_destroy(&state->nodes_mutex);
+    }
 }
 
 /**
@@ -1590,6 +1626,9 @@ int main(int argc, char *argv[])
     
     // Initialize node count to 0
     bb_data->num_nodes = 0;
+    
+    // Initialize global mutex
+    pthread_mutex_init(&bb_data->nodes_mutex, NULL);
 
     // Find where node specifications start (after rootdir and mountpoint)
     // We expect: bbfs [options] rootdir mountpoint node1 node2 ...
