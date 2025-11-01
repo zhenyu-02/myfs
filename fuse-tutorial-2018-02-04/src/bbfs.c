@@ -1066,9 +1066,13 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
                     window->start_offset, window->start_offset + window_size, window_size);
             
             // Reconstruct window data from fragments
+            // Note: When window doesn't start at offset 0, we need to properly handle the offset
             memset(window->buffer, 0, window_size);
             for (size_t i = 0; i < window_size; i++) {
                 size_t file_pos = window->start_offset + i;
+                // Round-robin distribution: byte at position 'file_pos' is in:
+                // - fragment (file_pos % num_data_fragments)
+                // - at position (file_pos / num_data_fragments) within that fragment
                 int frag_idx = file_pos % num_data_fragments;
                 size_t pos = file_pos / num_data_fragments;
                 
