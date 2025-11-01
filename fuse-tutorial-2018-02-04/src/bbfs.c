@@ -199,12 +199,13 @@ typedef struct {
     size_t size;
     size_t capacity;
     off_t max_offset;
+    size_t total_written;  // Track total bytes written to remote nodes
 } write_buffer_t;
 
 static write_buffer_t* get_write_buffer(const char* path, int create) {
     // For simplicity, use a static buffer for now
     // In production, you'd want a hash table of buffers per file
-    static write_buffer_t buffer = {NULL, 0, 0, 0};
+    static write_buffer_t buffer = {NULL, 0, 0, 0, 0};
     static char last_path[PATH_MAX] = "";
     
     // If different file, flush old buffer
@@ -214,15 +215,17 @@ static write_buffer_t* get_write_buffer(const char* path, int create) {
         buffer.size = 0;
         buffer.capacity = 0;
         buffer.max_offset = 0;
+        buffer.total_written = 0;
     }
     
     strncpy(last_path, path, PATH_MAX - 1);
     
     if (create && !buffer.buffer) {
-        buffer.capacity = 4 * 1024 * 1024;  // 4MB max
+        buffer.capacity = 8 * 1024 * 1024;  // 8MB buffer to reduce flushes
         buffer.buffer = (char*)malloc(buffer.capacity);
         buffer.size = 0;
         buffer.max_offset = 0;
+        buffer.total_written = 0;
     }
     
     return &buffer;
@@ -246,21 +249,79 @@ static int myfs_write(const char* path, const char* buf, size_t size, off_t offs
         return -ENOMEM;
     }
     
-    // Ensure buffer can hold data at this offset
-    size_t required_size = offset + size;
-    if (required_size > wb->capacity) {
-        fprintf(stderr, "[MYFS WRITE ERROR] Write exceeds buffer capacity (%zu > %zu)\n",
-                required_size, wb->capacity);
+    // Check if we need to flush buffer before writing
+    // Calculate position in buffer relative to what's already written
+    size_t buffer_start = wb->total_written;
+    size_t buffer_end = buffer_start + wb->capacity;
+    
+    // Check if this write is beyond our current buffer window
+    if (offset >= buffer_end || offset + size > buffer_end) {
+        // Need to flush current buffer and start new one
+        if (wb->size > 0) {
+            fprintf(stderr, "[MYFS WRITE] Flushing %zu bytes (offset %zu beyond buffer window)...\n", 
+                    wb->size, offset);
+            int flush_ret = myfs_flush_write_buffer(path);
+            if (flush_ret < 0) {
+                fprintf(stderr, "[MYFS WRITE ERROR] Failed to flush buffer: %d\n", flush_ret);
+                return flush_ret;
+            }
+            // After flush, get fresh buffer
+            wb = get_write_buffer(path, 1);
+            if (!wb || !wb->buffer) {
+                return -ENOMEM;
+            }
+        }
+    }
+    
+    // Check if single write is larger than buffer capacity
+    if (size > wb->capacity) {
+        fprintf(stderr, "[MYFS WRITE ERROR] Single write (%zu bytes) exceeds buffer capacity (%zu)\n",
+                size, wb->capacity);
+        // For very large single writes, we'd need streaming support
         return -EFBIG;
     }
     
-    // Copy data to buffer
-    memcpy(wb->buffer + offset, buf, size);
-    if (offset + size > wb->size) {
-        wb->size = offset + size;
+    // Check if write would overflow current buffer
+    size_t temp_offset = offset - wb->total_written;
+    if (temp_offset + size > wb->capacity) {
+        // Flush current buffer first
+        if (wb->size > 0) {
+            fprintf(stderr, "[MYFS WRITE] Buffer would overflow, flushing %zu bytes...\n", wb->size);
+            int flush_ret = myfs_flush_write_buffer(path);
+            if (flush_ret < 0) {
+                return flush_ret;
+            }
+            wb = get_write_buffer(path, 1);
+            if (!wb || !wb->buffer) {
+                return -ENOMEM;
+            }
+        }
     }
-    if (offset + size > wb->max_offset) {
-        wb->max_offset = offset + size;
+    
+    // Calculate buffer offset relative to total_written
+    size_t buffer_offset = (offset >= wb->total_written) ? (offset - wb->total_written) : offset;
+    
+    // For sequential writes after flush
+    if (buffer_offset == wb->size) {
+        // Append to buffer
+        memcpy(wb->buffer + wb->size, buf, size);
+        wb->size += size;
+        wb->max_offset = wb->total_written + wb->size;
+    } else if (buffer_offset < wb->size) {
+        // Overwrite existing data in buffer
+        memcpy(wb->buffer + buffer_offset, buf, size);
+        if (buffer_offset + size > wb->size) {
+            wb->size = buffer_offset + size;
+        }
+        wb->max_offset = wb->total_written + wb->size;
+    } else {
+        // Write beyond current buffer size - fill gap with zeros
+        if (buffer_offset > wb->size) {
+            memset(wb->buffer + wb->size, 0, buffer_offset - wb->size);
+        }
+        memcpy(wb->buffer + buffer_offset, buf, size);
+        wb->size = buffer_offset + size;
+        wb->max_offset = wb->total_written + wb->size;
     }
     
     fprintf(stderr, "[MYFS WRITE] Buffered %zu bytes at offset %ld (total buffered: %zu)\n",
@@ -280,6 +341,9 @@ static int myfs_flush_write_buffer(const char* path) {
     if (!wb || !wb->buffer || wb->size == 0) {
         return 0;  // Nothing to flush
     }
+    
+    // Store the buffer size before flushing (we'll need it to update metadata)
+    size_t flushed_size = wb->size;
     
     fprintf(stderr, "[MYFS FLUSH] ========== DISTRIBUTING %zu BYTES ==========\n", wb->size);
     log_msg("[MYFS FLUSH] Distributing %zu bytes to %d nodes\n", wb->size, num_nodes);
@@ -348,7 +412,8 @@ static int myfs_flush_write_buffer(const char* path) {
         req.type = REQ_WRITE;
         strncpy(req.filename, path + 1, sizeof(req.filename) - 1);  // Skip leading '/'
         req.size = fragment_size;
-        req.offset = 0;  // Write entire fragment from beginning
+        // For appending to existing fragments, calculate offset based on total_written
+        req.offset = (wb->total_written / num_data_fragments);  
         req.fragment_id = i;
         
         fprintf(stderr, "[MYFS FLUSH] Node %d: Sending header (file=%s, frag=%u, size=%zu, offset=%ld)...\n",
@@ -438,6 +503,40 @@ cleanup:
     if (retstat < 0) {
         fprintf(stderr, "[MYFS FLUSH] ========== FAILED: error=%d ==========\n", retstat);
     } else {
+        // Update total written counter
+        wb->total_written += flushed_size;
+        
+        // Update local metadata file size after successful flush
+        char fpath[PATH_MAX];
+        snprintf(fpath, PATH_MAX, "%s%s", state->rootdir, path);
+        
+        // Open the metadata file to update its size
+        int fd = open(fpath, O_WRONLY | O_CREAT, 0644);
+        if (fd >= 0) {
+            struct stat st;
+            if (fstat(fd, &st) == 0) {
+                // Update file size to match total written
+                off_t new_size = wb->total_written;
+                if (st.st_size < new_size) {
+                    if (ftruncate(fd, new_size) == 0) {
+                        fprintf(stderr, "[MYFS FLUSH] ✓ Updated metadata file size: %lld -> %lld bytes\n", 
+                                st.st_size, new_size);
+                        log_msg("[MYFS FLUSH] Updated metadata file size from %lld to %lld\n",
+                                st.st_size, new_size);
+                    } else {
+                        fprintf(stderr, "[MYFS FLUSH WARNING] Failed to update metadata file size: %s\n",
+                                strerror(errno));
+                    }
+                }
+            }
+            close(fd);
+        } else {
+            fprintf(stderr, "[MYFS FLUSH WARNING] Could not open metadata file to update size: %s\n",
+                    strerror(errno));
+        }
+        
+        fprintf(stderr, "[MYFS FLUSH] Total written to remote nodes: %zu bytes\n", wb->total_written);
+        
         // Clear buffer after successful flush
         wb->size = 0;
         wb->max_offset = 0;
