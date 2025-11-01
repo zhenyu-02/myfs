@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -206,6 +207,14 @@ typedef struct {
     size_t total_written;  // Track total bytes written to remote nodes
 } write_buffer_t;
 
+// Read cache to avoid repeatedly reading same file from network
+typedef struct {
+    char* buffer;           // Cached file content
+    size_t size;            // Size of cached content
+    char path[PATH_MAX];    // Path of cached file
+    time_t timestamp;       // When was this cached
+} read_cache_t;
+
 static write_buffer_t* get_write_buffer(const char* path, int create) {
     // For simplicity, use a static buffer for now
     // In production, you'd want a hash table of buffers per file
@@ -235,11 +244,63 @@ static write_buffer_t* get_write_buffer(const char* path, int create) {
     return &buffer;
 }
 
+// Get or create read cache for a file
+static read_cache_t* get_read_cache(const char* path, int create) {
+    static read_cache_t cache = {NULL, 0, "", 0};
+    
+    // If different file, free old cache
+    if (cache.buffer && strcmp(cache.path, path) != 0) {
+        fprintf(stderr, "[MYFS READ CACHE] Evicting cache for %s\n", cache.path);
+        free(cache.buffer);
+        cache.buffer = NULL;
+        cache.size = 0;
+        cache.path[0] = '\0';
+        cache.timestamp = 0;
+    }
+    
+    // If same file, check if cache is still valid (within 5 seconds)
+    if (cache.buffer && strcmp(cache.path, path) == 0) {
+        time_t now = time(NULL);
+        if (now - cache.timestamp > 5) {
+            // Cache expired, invalidate it
+            fprintf(stderr, "[MYFS READ CACHE] Cache expired for %s\n", path);
+            free(cache.buffer);
+            cache.buffer = NULL;
+            cache.size = 0;
+            cache.path[0] = '\0';
+            cache.timestamp = 0;
+        }
+    }
+    
+    if (create && !cache.buffer) {
+        strncpy(cache.path, path, PATH_MAX - 1);
+        cache.timestamp = time(NULL);
+    }
+    
+    return &cache;
+}
+
+// Invalidate read cache for a file (called after write/truncate)
+static void invalidate_read_cache(const char* path) {
+    read_cache_t* cache = get_read_cache(path, 0);
+    if (cache && cache->buffer && strcmp(cache->path, path) == 0) {
+        fprintf(stderr, "[MYFS READ CACHE] Invalidating cache for %s\n", path);
+        free(cache->buffer);
+        cache->buffer = NULL;
+        cache->size = 0;
+        cache->path[0] = '\0';
+        cache->timestamp = 0;
+    }
+}
+
 // Distributed write function
 static int myfs_write(const char* path, const char* buf, size_t size, off_t offset) {
     struct bb_state* state = BB_DATA;
     int num_nodes = state->num_nodes;
     int num_data_fragments = num_nodes - 1;  // n-1 data fragments
+    
+    // Invalidate read cache since file is being modified
+    invalidate_read_cache(path);
     
     fprintf(stderr, "[MYFS WRITE] path=%s, size=%zu, offset=%ld\n", 
             path, size, offset);
@@ -556,9 +617,8 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
     int num_nodes = state->num_nodes;
     int num_data_fragments = num_nodes - 1;
     
-    fprintf(stderr, "[MYFS READ] ========== START ==========\n");
-    fprintf(stderr, "[MYFS READ] path=%s, size=%zu, offset=%ld, nodes=%d\n", 
-            path, size, offset, num_nodes);
+    fprintf(stderr, "[MYFS READ] path=%s, size=%zu, offset=%ld\n", 
+            path, size, offset);
     log_msg("\n[MYFS READ] path=%s, size=%zu, offset=%ld, num_nodes=%d\n", 
             path, size, offset, num_nodes);
     
@@ -576,22 +636,35 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
     }
     
     size_t file_size = st.st_size;
-    fprintf(stderr, "[MYFS READ] File actual size: %zu bytes (requested: %zu bytes)\n", 
-            file_size, size);
-    log_msg("[MYFS READ] File actual size: %zu bytes (requested: %zu bytes)\n", 
-            file_size, size);
     
     // Limit read size to actual file size
     if (offset >= (off_t)file_size) {
-        fprintf(stderr, "[MYFS READ] Offset %ld >= file size %zu, returning 0\n", offset, file_size);
+        fprintf(stderr, "[MYFS READ] Offset %ld >= file size %zu, returning 0 (EOF)\n", offset, file_size);
         return 0;  // EOF
     }
     
     size_t bytes_to_read = size;
     if (offset + size > file_size) {
         bytes_to_read = file_size - offset;
-        fprintf(stderr, "[MYFS READ] Adjusted read size to %zu bytes (EOF)\n", bytes_to_read);
     }
+    
+    // Check read cache first
+    read_cache_t* cache = get_read_cache(path, 0);
+    if (cache && cache->buffer && cache->size == file_size) {
+        // Cache hit! Just copy from cache
+        fprintf(stderr, "[MYFS READ CACHE HIT] Serving %zu bytes from cache (offset=%ld)\n", 
+                bytes_to_read, offset);
+        log_msg("[MYFS READ CACHE HIT] path=%s, offset=%ld, size=%zu\n", path, offset, bytes_to_read);
+        memcpy(buf, cache->buffer + offset, bytes_to_read);
+        return bytes_to_read;
+    }
+    
+    // Cache miss - need to read from network
+    fprintf(stderr, "[MYFS READ] ========== CACHE MISS - Reading from nodes ==========\n");
+    fprintf(stderr, "[MYFS READ] File size: %zu bytes, reading %zu bytes at offset %ld\n", 
+            file_size, bytes_to_read, offset);
+    log_msg("[MYFS READ] File actual size: %zu bytes (requested: %zu bytes)\n", 
+            file_size, size);
     
     // Calculate fragment size based on ACTUAL FILE SIZE, not requested size
     size_t fragment_size = (file_size + num_data_fragments - 1) / num_data_fragments;
@@ -777,24 +850,54 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         log_msg("[MYFS READ] Successfully reconstructed fragment %d\n", failed_node);
     }
     
-    // Reconstruct original data from data fragments
-    // Only reconstruct the portion we actually need to read
-    memset(buf, 0, bytes_to_read);
-    
-    // Handle offset: we need to skip the first 'offset' bytes
-    for (size_t i = 0; i < bytes_to_read; i++) {
-        size_t file_pos = offset + i;  // Position in the original file
-        // Data was distributed round-robin, so reconstruct the same way
-        int frag_idx = file_pos % num_data_fragments;  // Which fragment has this byte
-        size_t pos = file_pos / num_data_fragments;  // Position within that fragment
-        buf[i] = fragments[frag_idx][pos];
+    // Reconstruct ENTIRE file and cache it (for subsequent reads)
+    // This is more efficient than reconstructing on every read request
+    cache = get_read_cache(path, 1);
+    if (!cache) {
+        fprintf(stderr, "[MYFS READ ERROR] Failed to get read cache\n");
+        // Continue anyway and just reconstruct for this request
+        memset(buf, 0, bytes_to_read);
+        for (size_t i = 0; i < bytes_to_read; i++) {
+            size_t file_pos = offset + i;
+            int frag_idx = file_pos % num_data_fragments;
+            size_t pos = file_pos / num_data_fragments;
+            buf[i] = fragments[frag_idx][pos];
+        }
+    } else {
+        // Allocate cache buffer for entire file
+        cache->buffer = (char*)malloc(file_size);
+        if (!cache->buffer) {
+            fprintf(stderr, "[MYFS READ ERROR] Failed to allocate cache buffer (%zu bytes)\n", file_size);
+            // Continue without caching
+            memset(buf, 0, bytes_to_read);
+            for (size_t i = 0; i < bytes_to_read; i++) {
+                size_t file_pos = offset + i;
+                int frag_idx = file_pos % num_data_fragments;
+                size_t pos = file_pos / num_data_fragments;
+                buf[i] = fragments[frag_idx][pos];
+            }
+        } else {
+            // Reconstruct entire file into cache
+            fprintf(stderr, "[MYFS READ] Reconstructing and caching entire file (%zu bytes)...\n", file_size);
+            for (size_t i = 0; i < file_size; i++) {
+                int frag_idx = i % num_data_fragments;
+                size_t pos = i / num_data_fragments;
+                cache->buffer[i] = fragments[frag_idx][pos];
+            }
+            cache->size = file_size;
+            
+            // Now copy requested portion to output buffer
+            memcpy(buf, cache->buffer + offset, bytes_to_read);
+            fprintf(stderr, "[MYFS READ] ✓ File cached! Serving %zu bytes from cache\n", bytes_to_read);
+            log_msg("[MYFS READ] Cached entire file (%zu bytes)\n", file_size);
+        }
     }
     
-    fprintf(stderr, "[MYFS READ] ✓ Read complete: %zu bytes (requested %zu, file_size %zu)\n", 
-            bytes_to_read, size, file_size);
+    fprintf(stderr, "[MYFS READ] ✓ Read complete: %zu bytes (file_size %zu)\n", 
+            bytes_to_read, file_size);
     log_msg("[MYFS READ] Reconstructed %zu bytes\n", bytes_to_read);
     
-    // Cleanup
+    // Cleanup fragments
     free(node_status);
     for (int i = 0; i < num_nodes; i++) {
         free(fragments[i]);
