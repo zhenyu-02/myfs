@@ -691,7 +691,7 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
         cd $MYFS_DIR
         ./src/bbfs ~/myfs_root ~/myfs_mount 127.0.0.1:8001 127.0.0.1:8002 127.0.0.1:8003 > /tmp/myfs_mount.log 2>&1 &
         BBFS_PID=$!
-        sleep 2
+        sleep 10
         
         if ! mount | grep -q myfs_mount; then
             echo "✗ 重新挂载失败"
