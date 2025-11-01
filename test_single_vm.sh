@@ -354,11 +354,12 @@ fi
 echo "✓ 测试3通过：容错机制正常工作"
 
 # ============================================================
-# 测试4：4MB文件（需要重启Node 2用于写入）
+# 测试4：4MB文件（需要确保Node 2在运行）
 # ============================================================
-read -p $'\n[测试4] 运行4MB文件测试？(y/n) ' -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
+echo -e "\n[测试4] 4MB文件测试"
+echo "----------------------------------------"
+# 检查Node 2是否在运行，如果测试3关闭了它，需要重启
+if ! ps -p $SERVER2_PID > /dev/null 2>&1; then
     echo "重启Node 2..."
     cd $MYFS_DIR
     ./src/server 8002 ~/storage_node2 &
@@ -375,35 +376,170 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     fusermount -u ~/myfs_mount
     sleep 1
     ./src/bbfs ~/myfs_root ~/myfs_mount 127.0.0.1:8001 127.0.0.1:8002 127.0.0.1:8003 > /tmp/myfs_mount.log 2>&1 &
+    BBFS_PID=$!
     sleep 2
-    
-    echo "创建4MB文件..."
-    dd if=/dev/urandom of=/tmp/4mb.dat bs=1M count=4 2>/dev/null
-    ORIGINAL_4MB_MD5=$(md5sum /tmp/4mb.dat | awk '{print $1}')
-    
-    echo "写入MYFS..."
-    time cp /tmp/4mb.dat ~/myfs_mount/
-    sync
-    sleep 1
-    
-    echo "读回并验证..."
-    READ_4MB_MD5=$(md5sum ~/myfs_mount/4mb.dat | awk '{print $1}')
-    
-    if [ "$ORIGINAL_4MB_MD5" = "$READ_4MB_MD5" ]; then
-        echo "✓ 4MB文件测试通过！MD5: $READ_4MB_MD5"
-    else
-        echo "✗ 4MB文件数据损坏"
-        echo "  原始: $ORIGINAL_4MB_MD5"
-        echo "  读回: $READ_4MB_MD5"
-        exit 1
-    fi
-    
-    # 显示片段分布
-    echo -e "\n片段数统计："
-    echo "  Node 1: $(ls ~/storage_node1/ | wc -l) 个文件"
-    echo "  Node 2: $(ls ~/storage_node2/ | wc -l) 个文件"
-    echo "  Node 3: $(ls ~/storage_node3/ | wc -l) 个文件"
 fi
+
+echo "创建4MB文件..."
+dd if=/dev/urandom of=/tmp/4mb.dat bs=1M count=4 2>/dev/null
+ORIGINAL_4MB_MD5=$(md5sum /tmp/4mb.dat | awk '{print $1}')
+
+echo "写入MYFS..."
+time cp /tmp/4mb.dat ~/myfs_mount/
+sync
+sleep 1
+
+echo "读回并验证..."
+READ_4MB_MD5=$(md5sum ~/myfs_mount/4mb.dat | awk '{print $1}')
+
+if [ "$ORIGINAL_4MB_MD5" = "$READ_4MB_MD5" ]; then
+    echo "✓ 4MB文件测试通过！MD5: $READ_4MB_MD5"
+else
+    echo "✗ 4MB文件数据损坏"
+    echo "  原始: $ORIGINAL_4MB_MD5"
+    echo "  读回: $READ_4MB_MD5"
+    exit 1
+fi
+
+echo "✓ 测试4通过：4MB文件正确存储和读取"
+
+# ============================================================
+# 测试5：40MB文件测试
+# ============================================================
+echo -e "\n[测试5] 40MB文件测试"
+echo "----------------------------------------"
+
+echo "创建40MB文件..."
+dd if=/dev/urandom of=/tmp/40mb.dat bs=1M count=40 2>/dev/null
+ORIGINAL_40MB_MD5=$(md5sum /tmp/40mb.dat | awk '{print $1}')
+ORIGINAL_40MB_SIZE=$(stat -c%s /tmp/40mb.dat 2>/dev/null || stat -f%z /tmp/40mb.dat)
+echo "原始文件: 大小=$ORIGINAL_40MB_SIZE bytes, MD5=$ORIGINAL_40MB_MD5"
+
+# 记录写入前的状态
+NODE1_FILES_BEFORE=$(ls ~/storage_node1/ | wc -l)
+NODE2_FILES_BEFORE=$(ls ~/storage_node2/ | wc -l)
+NODE3_FILES_BEFORE=$(ls ~/storage_node3/ | wc -l)
+
+echo "写入MYFS（预计需要一些时间）..."
+START_TIME=$(date +%s)
+cp /tmp/40mb.dat ~/myfs_mount/
+sync
+sleep 2
+END_TIME=$(date +%s)
+WRITE_TIME=$((END_TIME - START_TIME))
+echo "写入耗时: ${WRITE_TIME}秒"
+
+# 验证片段生成
+NODE1_FILES_AFTER=$(ls ~/storage_node1/ | wc -l)
+NODE2_FILES_AFTER=$(ls ~/storage_node2/ | wc -l)
+NODE3_FILES_AFTER=$(ls ~/storage_node3/ | wc -l)
+
+echo "新增文件数："
+echo "  Node 1: +$(($NODE1_FILES_AFTER - $NODE1_FILES_BEFORE))"
+echo "  Node 2: +$(($NODE2_FILES_AFTER - $NODE2_FILES_BEFORE))"
+echo "  Node 3: +$(($NODE3_FILES_AFTER - $NODE3_FILES_BEFORE))"
+
+# 显示40MB文件的片段大小
+echo -e "\n40MB文件片段大小："
+echo "Node 1: $(ls -lh ~/storage_node1/40mb.dat.frag0 2>/dev/null | awk '{print $5}')"
+echo "Node 2: $(ls -lh ~/storage_node2/40mb.dat.frag1 2>/dev/null | awk '{print $5}')"
+echo "Node 3 (Parity): $(ls -lh ~/storage_node3/40mb.dat.frag2 2>/dev/null | awk '{print $5}')"
+
+echo -e "\n读回并验证（预计需要一些时间）..."
+START_TIME=$(date +%s)
+READ_40MB_MD5=$(md5sum ~/myfs_mount/40mb.dat | awk '{print $1}')
+END_TIME=$(date +%s)
+READ_TIME=$((END_TIME - START_TIME))
+echo "读取耗时: ${READ_TIME}秒"
+
+if [ "$ORIGINAL_40MB_MD5" = "$READ_40MB_MD5" ]; then
+    echo "✓ 40MB文件MD5校验通过: $READ_40MB_MD5"
+else
+    echo "✗ 40MB文件MD5校验失败！"
+    echo "  原始: $ORIGINAL_40MB_MD5"
+    echo "  读回: $READ_40MB_MD5"
+    exit 1
+fi
+
+echo "✓ 测试5通过：40MB文件正确存储和读取"
+
+# ============================================================
+# 测试6：400MB文件测试（可选）
+# ============================================================
+read -p $'\n[测试6] 运行400MB大文件测试？这将需要较长时间 (y/n) ' -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo -e "\n[测试6] 400MB文件测试"
+    echo "----------------------------------------"
+    
+    # 检查可用空间
+    AVAIL_SPACE=$(df ~ | tail -1 | awk '{print $4}')
+    NEEDED_SPACE=1500000  # 需要约1.5GB
+    
+    if [ "$AVAIL_SPACE" -lt "$NEEDED_SPACE" ]; then
+        echo "✗ 空间不足，需要至少1.5GB可用空间"
+        echo "  当前可用: $(df -h ~ | tail -1 | awk '{print $4}')"
+    else
+        echo "创建400MB文件（使用/dev/zero加快速度）..."
+        dd if=/dev/zero of=/tmp/400mb.dat bs=1M count=400 2>/dev/null
+        ORIGINAL_400MB_MD5=$(md5sum /tmp/400mb.dat | awk '{print $1}')
+        ORIGINAL_400MB_SIZE=$(stat -c%s /tmp/400mb.dat 2>/dev/null || stat -f%z /tmp/400mb.dat)
+        echo "原始文件: 大小=$ORIGINAL_400MB_SIZE bytes, MD5=$ORIGINAL_400MB_MD5"
+        
+        echo "写入MYFS（预计需要较长时间）..."
+        START_TIME=$(date +%s)
+        cp /tmp/400mb.dat ~/myfs_mount/
+        sync
+        sleep 3
+        END_TIME=$(date +%s)
+        WRITE_TIME=$((END_TIME - START_TIME))
+        echo "写入耗时: ${WRITE_TIME}秒"
+        WRITE_SPEED=$((400 / WRITE_TIME))
+        echo "写入速度: 约${WRITE_SPEED} MB/s"
+        
+        # 显示400MB文件的片段大小
+        echo -e "\n400MB文件片段大小："
+        echo "Node 1: $(ls -lh ~/storage_node1/400mb.dat.frag0 2>/dev/null | awk '{print $5}')"
+        echo "Node 2: $(ls -lh ~/storage_node2/400mb.dat.frag1 2>/dev/null | awk '{print $5}')"
+        echo "Node 3 (Parity): $(ls -lh ~/storage_node3/400mb.dat.frag2 2>/dev/null | awk '{print $5}')"
+        
+        echo -e "\n读回并验证（预计需要较长时间）..."
+        START_TIME=$(date +%s)
+        READ_400MB_MD5=$(md5sum ~/myfs_mount/400mb.dat | awk '{print $1}')
+        END_TIME=$(date +%s)
+        READ_TIME=$((END_TIME - START_TIME))
+        echo "读取耗时: ${READ_TIME}秒"
+        READ_SPEED=$((400 / READ_TIME))
+        echo "读取速度: 约${READ_SPEED} MB/s"
+        
+        if [ "$ORIGINAL_400MB_MD5" = "$READ_400MB_MD5" ]; then
+            echo "✓ 400MB文件MD5校验通过: $READ_400MB_MD5"
+        else
+            echo "✗ 400MB文件MD5校验失败！"
+            echo "  原始: $ORIGINAL_400MB_MD5"
+            echo "  读回: $READ_400MB_MD5"
+            exit 1
+        fi
+        
+        echo "✓ 测试6通过：400MB文件正确存储和读取"
+        
+        # 清理大文件以节省空间
+        echo -e "\n清理临时文件..."
+        rm -f /tmp/400mb.dat
+    fi
+fi
+
+# 显示最终片段分布
+echo -e "\n最终片段数统计："
+echo "  Node 1: $(ls ~/storage_node1/ | wc -l) 个文件"
+echo "  Node 2: $(ls ~/storage_node2/ | wc -l) 个文件"
+echo "  Node 3: $(ls ~/storage_node3/ | wc -l) 个文件"
+
+# 显示存储使用情况
+echo -e "\n存储使用情况："
+echo "  Node 1: $(du -sh ~/storage_node1/ | awk '{print $1}')"
+echo "  Node 2: $(du -sh ~/storage_node2/ | awk '{print $1}')"
+echo "  Node 3: $(du -sh ~/storage_node3/ | awk '{print $1}')"
 
 echo -e "\n=========================================="
 echo "所有测试通过！"
@@ -415,9 +551,17 @@ echo "  ✓ 每个节点都收到了数据片段"
 echo "  ✓ 数据完整性通过MD5验证"
 echo "  ✓ 单节点失效时能通过XOR恢复数据"
 echo "  ✓ 恢复的数据与原始数据完全一致"
+echo "  ✓ 支持从小文件到400MB大文件的存储"
+echo ""
+echo "测试文件大小范围："
+echo "  - 小文件: 52 bytes"
+echo "  - 中等文件: 1MB, 4MB"  
+echo "  - 大文件: 40MB"
+echo "  - 超大文件: 400MB (如果测试)"
 echo ""
 echo "清理命令："
 echo "  fusermount -u ~/myfs_mount"
 echo "  pkill -f 'server 800'"
+echo "  rm -f /tmp/*.dat"
 echo ""
 
