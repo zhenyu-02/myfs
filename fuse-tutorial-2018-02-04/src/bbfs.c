@@ -390,10 +390,11 @@ static int myfs_flush_write_buffer(const char* path) {
     // Distribute buffered data across fragments
     fprintf(stderr, "[MYFS FLUSH] Distributing data across %d data fragments...\n", num_data_fragments);
     for (size_t i = 0; i < wb->size; i++) {
-        int frag_idx = (i / fragment_size) % num_data_fragments;  // Which fragment
-        size_t frag_pos = i % fragment_size;  // Position within fragment
+        // Distribute data in round-robin fashion across data fragments
+        int frag_idx = i % num_data_fragments;  // Which data fragment (0 or 1 for 3 nodes)
+        size_t frag_pos = i / num_data_fragments;  // Position within that fragment
         
-        if (frag_idx < num_data_fragments && frag_pos < fragment_size) {
+        if (frag_pos < fragment_size) {
             fragments[frag_idx][frag_pos] = wb->buffer[i];
         }
     }
@@ -783,8 +784,9 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
     // Handle offset: we need to skip the first 'offset' bytes
     for (size_t i = 0; i < bytes_to_read; i++) {
         size_t file_pos = offset + i;  // Position in the original file
-        int frag_idx = (file_pos / fragment_size) % num_data_fragments;
-        size_t pos = file_pos % fragment_size;
+        // Data was distributed round-robin, so reconstruct the same way
+        int frag_idx = file_pos % num_data_fragments;  // Which fragment has this byte
+        size_t pos = file_pos / num_data_fragments;  // Position within that fragment
         buf[i] = fragments[frag_idx][pos];
     }
     
