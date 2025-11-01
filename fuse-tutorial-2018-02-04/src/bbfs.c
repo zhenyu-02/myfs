@@ -36,6 +36,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -185,6 +186,9 @@ static int init_node_connections() {
     log_msg("[MYFS] All nodes connected successfully!\n");
     return 0;
 }
+
+// Forward declarations
+static int myfs_flush_write_buffer(const char* path);
 
 // XOR data buffers for parity calculation
 static void xor_buffers(char* dest, const char* src, size_t size) {
@@ -519,10 +523,10 @@ cleanup:
                 off_t new_size = wb->total_written;
                 if (st.st_size < new_size) {
                     if (ftruncate(fd, new_size) == 0) {
-                        fprintf(stderr, "[MYFS FLUSH] ✓ Updated metadata file size: %lld -> %lld bytes\n", 
-                                st.st_size, new_size);
-                        log_msg("[MYFS FLUSH] Updated metadata file size from %lld to %lld\n",
-                                st.st_size, new_size);
+                        fprintf(stderr, "[MYFS FLUSH] ✓ Updated metadata file size: %ld -> %ld bytes\n", 
+                                (long)st.st_size, (long)new_size);
+                        log_msg("[MYFS FLUSH] Updated metadata file size from %ld to %ld\n",
+                                (long)st.st_size, (long)new_size);
                     } else {
                         fprintf(stderr, "[MYFS FLUSH WARNING] Failed to update metadata file size: %s\n",
                                 strerror(errno));
@@ -1123,9 +1127,9 @@ int bb_write(const char *path, const char *buf, size_t size, off_t offset,
                 // Only extend file if new write goes beyond current size
                 if (st.st_size < new_size) {
                     if (ftruncate(fi->fh, new_size) == 0) {
-                        log_msg("[MYFS] Updated local metadata file size: %lld -> %lld bytes\n", 
-                                st.st_size, new_size);
-                        fprintf(stderr, "[MYFS] ✓ Updated metadata file size to %lld bytes\n", new_size);
+                        log_msg("[MYFS] Updated local metadata file size: %ld -> %ld bytes\n", 
+                                (long)st.st_size, (long)new_size);
+                        fprintf(stderr, "[MYFS] ✓ Updated metadata file size to %ld bytes\n", (long)new_size);
                     } else {
                         log_msg("[MYFS ERROR] Failed to update file size: %s\n", strerror(errno));
                         fprintf(stderr, "[MYFS ERROR] Failed to update metadata file size\n");
