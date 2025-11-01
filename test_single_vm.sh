@@ -148,14 +148,26 @@ echo "  Node 3: $NODE3_AFTER 个文件"
 # 验证每个节点都产生了新文件
 if [ $NODE1_AFTER -le $NODE1_BEFORE ]; then
     echo "✗ Node 1 没有产生新文件！"
+    echo ""
+    echo "调试信息："
+    echo "  查看Node 1目录: ls -la ~/storage_node1/"
+    echo "  查看MYFS日志: tail -50 ~/myfs-zy/fuse-tutorial-2018-02-04/bbfs.log"
     exit 1
 fi
 if [ $NODE2_AFTER -le $NODE2_BEFORE ]; then
     echo "✗ Node 2 没有产生新文件！"
+    echo ""
+    echo "调试信息："
+    echo "  查看Node 2目录: ls -la ~/storage_node2/"
+    echo "  查看MYFS日志: tail -50 ~/myfs-zy/fuse-tutorial-2018-02-04/bbfs.log"
     exit 1
 fi
 if [ $NODE3_AFTER -le $NODE3_BEFORE ]; then
     echo "✗ Node 3 没有产生新文件！"
+    echo ""
+    echo "调试信息："
+    echo "  查看Node 3目录: ls -la ~/storage_node3/"
+    echo "  查看MYFS日志: tail -50 ~/myfs-zy/fuse-tutorial-2018-02-04/bbfs.log"
     exit 1
 fi
 
@@ -398,6 +410,11 @@ else
     echo "✗ 4MB文件数据损坏"
     echo "  原始: $ORIGINAL_4MB_MD5"
     echo "  读回: $READ_4MB_MD5"
+    echo ""
+    echo "调试信息："
+    echo "  查看片段文件: ls -lh ~/storage_node{1,2,3}/4mb.dat.frag*"
+    echo "  查看MYFS日志: tail -100 ~/myfs-zy/fuse-tutorial-2018-02-04/bbfs.log"
+    echo "  验证原始文件: md5sum /tmp/4mb.dat ~/myfs_mount/4mb.dat"
     exit 1
 fi
 
@@ -458,18 +475,102 @@ else
     echo "✗ 40MB文件MD5校验失败！"
     echo "  原始: $ORIGINAL_40MB_MD5"
     echo "  读回: $READ_40MB_MD5"
+    echo ""
+    echo "调试信息："
+    echo "  查看片段文件: ls -lh ~/storage_node{1,2,3}/40mb.dat.frag*"
+    echo "  查看MYFS日志: tail -100 ~/myfs-zy/fuse-tutorial-2018-02-04/bbfs.log"
+    echo "  查看挂载日志: tail -50 /tmp/myfs_mount.log"
+    echo "  比对原始文件: md5sum /tmp/40mb.dat ~/myfs_mount/40mb.dat"
     exit 1
 fi
 
 echo "✓ 测试5通过：40MB文件正确存储和读取"
 
 # ============================================================
-# 测试6：400MB文件测试（可选）
+# 测试6：关闭节点后读取4MB文件
 # ============================================================
-read -p $'\n[测试6] 运行400MB大文件测试？这将需要较长时间 (y/n) ' -n 1 -r
+echo -e "\n[测试6] 容错测试 - 关闭节点后读取4MB文件"
+echo "----------------------------------------"
+
+# 保存4MB文件的原始MD5（之前测试4已经写入）
+echo "当前4MB文件的MD5："
+ORIGINAL_4MB_MD5_BACKUP=$(md5sum ~/myfs_mount/4mb.dat 2>/dev/null | awk '{print $1}')
+echo "  $ORIGINAL_4MB_MD5_BACKUP"
+
+# 关闭Node 2
+echo -e "\n模拟节点失效：关闭Node 2..."
+kill $SERVER2_PID 2>/dev/null
+sleep 2
+
+# 验证Node 2确实关闭
+if ps -p $SERVER2_PID > /dev/null 2>&1; then
+    echo "✗ Node 2 仍在运行，无法模拟失效"
+    exit 1
+fi
+echo "✓ Node 2 已停止（模拟节点失效）"
+
+# 卸载并重新挂载（强制从节点读取）
+echo -e "\n卸载并重新挂载MYFS..."
+fusermount -u ~/myfs_mount
+sleep 1
+
+cd $MYFS_DIR
+./src/bbfs ~/myfs_root ~/myfs_mount 127.0.0.1:8001 127.0.0.1:8002 127.0.0.1:8003 > /tmp/myfs_mount.log 2>&1 &
+BBFS_PID=$!
+sleep 2
+
+if ! mount | grep -q myfs_mount; then
+    echo "✗ 重新挂载失败"
+    echo ""
+    echo "调试信息："
+    echo "  查看挂载日志: tail -50 /tmp/myfs_mount.log"
+    exit 1
+fi
+echo "✓ 重新挂载成功"
+
+# 尝试读取4MB文件（应通过Node 1 + Node 3恢复Node 2的数据）
+echo -e "\n读取4MB文件（Node 2失效，使用XOR恢复）..."
+START_TIME=$(date +%s)
+RECOVERED_4MB_MD5=$(md5sum ~/myfs_mount/4mb.dat 2>/dev/null | awk '{print $1}')
+END_TIME=$(date +%s)
+READ_TIME=$((END_TIME - START_TIME))
+echo "读取耗时: ${READ_TIME}秒"
+
+if [ -z "$RECOVERED_4MB_MD5" ]; then
+    echo "✗ 读取失败！容错机制未生效"
+    echo ""
+    echo "调试信息："
+    echo "  查看MYFS日志: tail -100 ~/myfs-zy/fuse-tutorial-2018-02-04/bbfs.log | grep 'MYFS READ'"
+    echo "  查看挂载日志: tail -50 /tmp/myfs_mount.log"
+    echo "  查看存活节点: ps aux | grep '[s]erver 800'"
+    echo "  查看Node 1片段: ls -lh ~/storage_node1/4mb.dat.frag0"
+    echo "  查看Node 3片段: ls -lh ~/storage_node3/4mb.dat.frag2"
+    exit 1
+fi
+
+if [ "$RECOVERED_4MB_MD5" = "$ORIGINAL_4MB_MD5_BACKUP" ]; then
+    echo "✓ 4MB文件XOR恢复成功！MD5: $RECOVERED_4MB_MD5"
+else
+    echo "✗ 4MB文件XOR恢复的数据不正确！"
+    echo "  原始: $ORIGINAL_4MB_MD5_BACKUP"
+    echo "  恢复: $RECOVERED_4MB_MD5"
+    echo ""
+    echo "调试信息："
+    echo "  查看MYFS日志: tail -100 ~/myfs-zy/fuse-tutorial-2018-02-04/bbfs.log | grep 'XOR'"
+    echo "  查看存活片段: ls -lh ~/storage_node{1,3}/4mb.dat.frag*"
+    echo "  验证原始文件: md5sum /tmp/4mb.dat"
+    exit 1
+fi
+
+echo "✓ 测试6通过：节点失效情况下4MB文件XOR恢复成功"
+
+# ============================================================
+# 测试7：400MB文件测试（写入+正常读取+容错读取）
+# ============================================================
+read -p $'\n[测试7] 运行400MB大文件测试（含容错）？这将需要较长时间 (y/n) ' -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
-    echo -e "\n[测试6] 400MB文件测试"
+    echo -e "\n[测试7] 400MB文件测试（写入、读取、容错）"
     echo "----------------------------------------"
     
     # 检查可用空间
@@ -480,7 +581,40 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
         echo "✗ 空间不足，需要至少1.5GB可用空间"
         echo "  当前可用: $(df -h ~ | tail -1 | awk '{print $4}')"
     else
-        echo "创建400MB文件（使用/dev/zero加快速度）..."
+        # 7.1 - 重启Node 2用于写入
+        echo "重启Node 2用于写入大文件..."
+        cd $MYFS_DIR
+        ./src/server 8002 ~/storage_node2 &
+        SERVER2_PID=$!
+        sleep 3
+        
+        if ! ps -p $SERVER2_PID > /dev/null; then
+            echo "✗ Node 2 启动失败"
+            echo ""
+            echo "调试信息："
+            echo "  查看进程: ps aux | grep server"
+            echo "  查看端口: netstat -tlnp | grep 8002"
+            exit 1
+        fi
+        echo "✓ Node 2 已重启 (PID: $SERVER2_PID)"
+        
+        # 卸载并重新挂载（连接到所有3个节点）
+        fusermount -u ~/myfs_mount
+        sleep 1
+        ./src/bbfs ~/myfs_root ~/myfs_mount 127.0.0.1:8001 127.0.0.1:8002 127.0.0.1:8003 > /tmp/myfs_mount.log 2>&1 &
+        BBFS_PID=$!
+        sleep 2
+        
+        if ! mount | grep -q myfs_mount; then
+            echo "✗ 重新挂载失败"
+            echo ""
+            echo "调试信息："
+            echo "  查看挂载日志: tail -50 /tmp/myfs_mount.log"
+            exit 1
+        fi
+        
+        # 7.2 - 写入400MB文件
+        echo -e "\n创建400MB文件（使用/dev/zero加快速度）..."
         dd if=/dev/zero of=/tmp/400mb.dat bs=1M count=400 2>/dev/null
         ORIGINAL_400MB_MD5=$(md5sum /tmp/400mb.dat | awk '{print $1}')
         ORIGINAL_400MB_SIZE=$(stat -c%s /tmp/400mb.dat 2>/dev/null || stat -f%z /tmp/400mb.dat)
@@ -494,8 +628,10 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
         END_TIME=$(date +%s)
         WRITE_TIME=$((END_TIME - START_TIME))
         echo "写入耗时: ${WRITE_TIME}秒"
-        WRITE_SPEED=$((400 / WRITE_TIME))
-        echo "写入速度: 约${WRITE_SPEED} MB/s"
+        if [ $WRITE_TIME -gt 0 ]; then
+            WRITE_SPEED=$((400 / WRITE_TIME))
+            echo "写入速度: 约${WRITE_SPEED} MB/s"
+        fi
         
         # 显示400MB文件的片段大小
         echo -e "\n400MB文件片段大小："
@@ -503,25 +639,103 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
         echo "Node 2: $(ls -lh ~/storage_node2/400mb.dat.frag1 2>/dev/null | awk '{print $5}')"
         echo "Node 3 (Parity): $(ls -lh ~/storage_node3/400mb.dat.frag2 2>/dev/null | awk '{print $5}')"
         
-        echo -e "\n读回并验证（预计需要较长时间）..."
+        # 7.3 - 正常读取验证
+        echo -e "\n读回并验证（所有节点正常）..."
         START_TIME=$(date +%s)
-        READ_400MB_MD5=$(md5sum ~/myfs_mount/400mb.dat | awk '{print $1}')
+        READ_400MB_MD5=$(md5sum ~/myfs_mount/400mb.dat 2>/dev/null | awk '{print $1}')
         END_TIME=$(date +%s)
         READ_TIME=$((END_TIME - START_TIME))
         echo "读取耗时: ${READ_TIME}秒"
-        READ_SPEED=$((400 / READ_TIME))
-        echo "读取速度: 约${READ_SPEED} MB/s"
+        if [ $READ_TIME -gt 0 ]; then
+            READ_SPEED=$((400 / READ_TIME))
+            echo "读取速度: 约${READ_SPEED} MB/s"
+        fi
         
-        if [ "$ORIGINAL_400MB_MD5" = "$READ_400MB_MD5" ]; then
-            echo "✓ 400MB文件MD5校验通过: $READ_400MB_MD5"
-        else
-            echo "✗ 400MB文件MD5校验失败！"
-            echo "  原始: $ORIGINAL_400MB_MD5"
-            echo "  读回: $READ_400MB_MD5"
+        if [ -z "$READ_400MB_MD5" ]; then
+            echo "✗ 400MB文件读取失败！"
+            echo ""
+            echo "调试信息："
+            echo "  查看MYFS日志: tail -200 ~/myfs-zy/fuse-tutorial-2018-02-04/bbfs.log"
+            echo "  查看片段文件: ls -lh ~/storage_node{1,2,3}/400mb.dat.frag*"
             exit 1
         fi
         
-        echo "✓ 测试6通过：400MB文件正确存储和读取"
+        if [ "$ORIGINAL_400MB_MD5" != "$READ_400MB_MD5" ]; then
+            echo "✗ 400MB文件MD5校验失败！"
+            echo "  原始: $ORIGINAL_400MB_MD5"
+            echo "  读回: $READ_400MB_MD5"
+            echo ""
+            echo "调试信息："
+            echo "  查看片段大小: du -h ~/storage_node{1,2,3}/400mb.dat.frag*"
+            echo "  验证原始文件: md5sum /tmp/400mb.dat"
+            echo "  查看MYFS日志: tail -200 ~/myfs-zy/fuse-tutorial-2018-02-04/bbfs.log"
+            exit 1
+        fi
+        
+        echo "✓ 400MB文件MD5校验通过: $READ_400MB_MD5"
+        
+        # 7.4 - 容错读取测试：关闭Node 2后读取
+        echo -e "\n[容错测试] 关闭Node 2后读取400MB文件..."
+        kill $SERVER2_PID 2>/dev/null
+        sleep 2
+        
+        if ps -p $SERVER2_PID > /dev/null 2>&1; then
+            echo "✗ Node 2 仍在运行"
+            exit 1
+        fi
+        echo "✓ Node 2 已停止（模拟节点失效）"
+        
+        # 卸载并重新挂载
+        fusermount -u ~/myfs_mount
+        sleep 1
+        cd $MYFS_DIR
+        ./src/bbfs ~/myfs_root ~/myfs_mount 127.0.0.1:8001 127.0.0.1:8002 127.0.0.1:8003 > /tmp/myfs_mount.log 2>&1 &
+        BBFS_PID=$!
+        sleep 2
+        
+        if ! mount | grep -q myfs_mount; then
+            echo "✗ 重新挂载失败"
+            echo ""
+            echo "调试信息："
+            echo "  查看挂载日志: tail -50 /tmp/myfs_mount.log"
+            exit 1
+        fi
+        
+        echo "读取400MB文件（Node 2失效，使用XOR恢复）..."
+        START_TIME=$(date +%s)
+        RECOVERED_400MB_MD5=$(md5sum ~/myfs_mount/400mb.dat 2>/dev/null | awk '{print $1}')
+        END_TIME=$(date +%s)
+        RECOVER_TIME=$((END_TIME - START_TIME))
+        echo "恢复读取耗时: ${RECOVER_TIME}秒"
+        if [ $RECOVER_TIME -gt 0 ]; then
+            RECOVER_SPEED=$((400 / RECOVER_TIME))
+            echo "恢复读取速度: 约${RECOVER_SPEED} MB/s"
+        fi
+        
+        if [ -z "$RECOVERED_400MB_MD5" ]; then
+            echo "✗ 400MB文件容错读取失败！"
+            echo ""
+            echo "调试信息："
+            echo "  查看MYFS日志: tail -200 ~/myfs-zy/fuse-tutorial-2018-02-04/bbfs.log | grep 'XOR'"
+            echo "  查看存活节点: ps aux | grep '[s]erver 800'"
+            echo "  查看存活片段: ls -lh ~/storage_node{1,3}/400mb.dat.frag*"
+            exit 1
+        fi
+        
+        if [ "$RECOVERED_400MB_MD5" = "$ORIGINAL_400MB_MD5" ]; then
+            echo "✓ 400MB文件XOR恢复成功！MD5: $RECOVERED_400MB_MD5"
+        else
+            echo "✗ 400MB文件XOR恢复的数据不正确！"
+            echo "  原始: $ORIGINAL_400MB_MD5"
+            echo "  恢复: $RECOVERED_400MB_MD5"
+            echo ""
+            echo "调试信息："
+            echo "  查看MYFS日志: tail -200 ~/myfs-zy/fuse-tutorial-2018-02-04/bbfs.log | grep 'Reconstructing'"
+            echo "  查看存活片段: du -h ~/storage_node{1,3}/400mb.dat.frag*"
+            exit 1
+        fi
+        
+        echo "✓ 测试7通过：400MB文件写入、读取和容错恢复全部成功"
         
         # 清理大文件以节省空间
         echo -e "\n清理临时文件..."
@@ -552,12 +766,16 @@ echo "  ✓ 数据完整性通过MD5验证"
 echo "  ✓ 单节点失效时能通过XOR恢复数据"
 echo "  ✓ 恢复的数据与原始数据完全一致"
 echo "  ✓ 支持从小文件到400MB大文件的存储"
+echo "  ✓ 大文件(4MB, 400MB)在节点失效情况下XOR恢复成功"
 echo ""
-echo "测试文件大小范围："
-echo "  - 小文件: 52 bytes"
-echo "  - 中等文件: 1MB, 4MB"  
-echo "  - 大文件: 40MB"
-echo "  - 超大文件: 400MB (如果测试)"
+echo "完成的测试："
+echo "  [测试1] 小文件写入与片段验证 (52 bytes)"
+echo "  [测试2] 1MB文件分片验证"
+echo "  [测试3] 容错读取验证（XOR恢复小文件和1MB文件）"
+echo "  [测试4] 4MB文件测试"
+echo "  [测试5] 40MB文件测试"
+echo "  [测试6] 容错测试 - 节点失效情况下读取4MB文件"
+echo "  [测试7] 400MB文件测试（写入、读取、容错）- 可选"
 echo ""
 echo "清理命令："
 echo "  fusermount -u ~/myfs_mount"
