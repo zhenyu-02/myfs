@@ -48,6 +48,8 @@ void* handle_client(void* arg) {
     
     request_header_t req;
     response_header_t resp;
+    // Initialize response to avoid sending garbage
+    memset(&resp, 0, sizeof(resp));
     char filepath[PATH_MAX];
     char* data_buffer = NULL;
     
@@ -64,6 +66,9 @@ void* handle_client(void* arg) {
         
         printf("[Server] Request type=%d, file=%s, size=%zu, offset=%ld\n", 
                req.type, filepath, req.size, req.offset);
+        
+        // Always reset response for each request
+        memset(&resp, 0, sizeof(resp));
         
         if (req.type == REQ_WRITE) {
             // Allocate buffer for data

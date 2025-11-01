@@ -340,6 +340,7 @@ static int myfs_flush_write_buffer(const char* path) {
     for (int i = 0; i < num_nodes; i++) {
         request_header_t req;
         response_header_t resp;
+        memset(&resp, 0, sizeof(resp));  // Initialize response
         
         req.type = REQ_WRITE;
         strncpy(req.filename, path + 1, sizeof(req.filename) - 1);  // Skip leading '/'
@@ -525,6 +526,8 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         request_header_t req;
         response_header_t resp;
         
+        // CRITICAL: Initialize response header to avoid garbage values
+        memset(&resp, 0, sizeof(resp));
         req.type = REQ_READ;
         strncpy(req.filename, path + 1, sizeof(req.filename) - 1);  // Skip leading '/'
         req.size = fragment_size;
@@ -562,7 +565,7 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         
         // Receive response
         if (recv(state->nodes[i].socket_fd, &resp, sizeof(resp), MSG_WAITALL) != sizeof(resp)) {
-            fprintf(stderr, "[MYFS READ] ✗ Node %d: Failed to receive response\n", i);
+            fprintf(stderr, "[MYFS READ] ✗ Node %d: Failed to receive response (connection lost)\n", i);
             log_msg("Failed to receive response from node %d\n", i);
             node_status[i] = 0;
             continue;
@@ -571,7 +574,7 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         if (resp.status != 0) {
             fprintf(stderr, "[MYFS READ] ✗ Node %d: Server returned error: status=%d, errno=%d\n", 
                     i, resp.status, resp.error_code);
-            log_msg("Node %d returned error: %d\n", i, resp.error_code);
+            log_msg("Node %d returned error: status=%d, errno=%d\n", i, resp.status, resp.error_code);
             node_status[i] = 0;
             continue;
         }
@@ -580,10 +583,17 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         fprintf(stderr, "[MYFS READ] Node %d: Receiving data (%zu bytes)...\n", i, resp.size);
         if (resp.size > 0) {
             ssize_t received = recv(state->nodes[i].socket_fd, fragments[i], resp.size, MSG_WAITALL);
-            if (received != (ssize_t)resp.size) {
-                fprintf(stderr, "[MYFS READ] ✗ Node %d: Failed to receive data (expected %zu, got %zd)\n", 
+            if (received < 0) {
+                // recv error
+                fprintf(stderr, "[MYFS READ] ✗ Node %d: recv error: %s\n", i, strerror(errno));
+                log_msg("Failed to receive data from node %d: %s\n", i, strerror(errno));
+                node_status[i] = 0;
+                continue;
+            } else if (received != (ssize_t)resp.size) {
+                // Partial recv - connection might be broken
+                fprintf(stderr, "[MYFS READ] ✗ Node %d: Partial data received (expected %zu, got %zd)\n", 
                         i, resp.size, received);
-                log_msg("Failed to receive data from node %d\n", i);
+                log_msg("Failed to receive data from node %d (partial)\n", i);
                 node_status[i] = 0;
                 continue;
             }
