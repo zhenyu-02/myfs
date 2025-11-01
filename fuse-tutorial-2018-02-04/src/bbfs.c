@@ -57,6 +57,7 @@
 // Read optimization for large files
 #define LARGE_FILE_THRESHOLD (1 * 1024 * 1024)  // 1MB - files larger than this are considered "large"
 #define MIN_READ_AHEAD_SIZE (4 * 1024 * 1024)   // 4MB - minimum read-ahead for large files
+#define READAHEAD_WINDOW_SIZE (16 * 1024 * 1024) // 16MB - sliding window for large file reads
 
 //  All the paths I see are relative to the root of the mounted
 //  filesystem.  In order to get to the underlying filesystem, I need to
@@ -223,6 +224,15 @@ typedef struct {
     time_t timestamp;       // When was this cached
 } read_cache_t;
 
+// Read-ahead window for large files (sliding window approach)
+typedef struct {
+    char* buffer;           // Window buffer (READAHEAD_WINDOW_SIZE bytes)
+    off_t start_offset;     // Starting offset of this window in the file
+    size_t valid_size;      // Valid data size in the window
+    char path[PATH_MAX];    // Path of the file this window belongs to
+    time_t timestamp;       // When was this window loaded
+} readahead_window_t;
+
 static write_buffer_t* get_write_buffer(const char* path, int create) {
     // For simplicity, use a static buffer for now
     // In production, you'd want a hash table of buffers per file
@@ -301,14 +311,66 @@ static void invalidate_read_cache(const char* path) {
     }
 }
 
+// Get or manage readahead window for large files
+static readahead_window_t* get_readahead_window(const char* path, int create) {
+    static readahead_window_t window = {NULL, -1, 0, "", 0};
+    
+    // If different file, free old window
+    if (window.buffer && strcmp(window.path, path) != 0) {
+        fprintf(stderr, "[MYFS READAHEAD] Evicting window for %s\n", window.path);
+        free(window.buffer);
+        window.buffer = NULL;
+        window.start_offset = -1;
+        window.valid_size = 0;
+        window.path[0] = '\0';
+        window.timestamp = 0;
+    }
+    
+    // Check if window has expired (use same TTL as cache)
+    if (window.buffer && strcmp(window.path, path) == 0) {
+        time_t now = time(NULL);
+        if (now - window.timestamp > CACHE_TTL_SECONDS) {
+            fprintf(stderr, "[MYFS READAHEAD] Window expired for %s\n", path);
+            free(window.buffer);
+            window.buffer = NULL;
+            window.start_offset = -1;
+            window.valid_size = 0;
+            window.path[0] = '\0';
+            window.timestamp = 0;
+        }
+    }
+    
+    if (create && !window.buffer) {
+        strncpy(window.path, path, PATH_MAX - 1);
+        window.timestamp = time(NULL);
+    }
+    
+    return &window;
+}
+
+// Invalidate readahead window for a file (called after write/truncate)
+static void invalidate_readahead_window(const char* path) {
+    readahead_window_t* window = get_readahead_window(path, 0);
+    if (window && window->buffer && strcmp(window->path, path) == 0) {
+        fprintf(stderr, "[MYFS READAHEAD] Invalidating window for %s\n", path);
+        free(window->buffer);
+        window->buffer = NULL;
+        window->start_offset = -1;
+        window->valid_size = 0;
+        window->path[0] = '\0';
+        window->timestamp = 0;
+    }
+}
+
 // Distributed write function
 static int myfs_write(const char* path, const char* buf, size_t size, off_t offset) {
     struct bb_state* state = BB_DATA;
     int num_nodes = state->num_nodes;
     int num_data_fragments = num_nodes - 1;  // n-1 data fragments
     
-    // Invalidate read cache since file is being modified
+    // Invalidate read cache and readahead window since file is being modified
     invalidate_read_cache(path);
+    invalidate_readahead_window(path);
     
     fprintf(stderr, "[MYFS WRITE] path=%s, size=%zu, offset=%ld\n", 
             path, size, offset);
@@ -686,9 +748,30 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
                 invalidate_read_cache(path);
             }
         }
+    } else {
+        // Large file: check readahead window first
+        readahead_window_t* window = get_readahead_window(path, 0);
+        if (window && window->buffer && strcmp(window->path, path) == 0 &&
+            offset >= window->start_offset && 
+            offset + bytes_to_read <= window->start_offset + window->valid_size) {
+            
+            // Window hit! Serve from readahead buffer
+            size_t window_offset = offset - window->start_offset;
+            fprintf(stderr, "[MYFS READAHEAD HIT] Serving %zu bytes from window (offset=%ld, window_start=%ld)\n", 
+                    bytes_to_read, offset, window->start_offset);
+            log_msg("[MYFS READAHEAD HIT] path=%s, offset=%ld, size=%zu, window=[%ld,%ld]\n", 
+                    path, offset, bytes_to_read, window->start_offset, 
+                    window->start_offset + window->valid_size);
+            
+            memcpy(buf, window->buffer + window_offset, bytes_to_read);
+            return bytes_to_read;
+        }
+        
+        // Window miss - will need to load new window from network
+        fprintf(stderr, "[MYFS READAHEAD MISS] Need to load new window for offset=%ld\n", offset);
     }
     
-    // Cache miss - need to read from network
+    // Cache/Window miss - need to read from network
     fprintf(stderr, "[MYFS READ] ========== CACHE MISS - Reading from nodes ==========\n");
     fprintf(stderr, "[MYFS READ] File size: %zu bytes, reading %zu bytes at offset %ld\n", 
             file_size, bytes_to_read, offset);
@@ -932,20 +1015,80 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
             }
         }
     } else {
-        // Large file: don't cache, reconstruct only requested portion
-        fprintf(stderr, "[MYFS READ] Large file - reconstructing %zu bytes without caching\n", bytes_to_read);
-        log_msg("[MYFS READ] Reconstructing %zu bytes for large file (no cache)\n", bytes_to_read);
+        // Large file: use readahead window strategy
+        fprintf(stderr, "[MYFS READ] Large file - using readahead window strategy\n");
+        log_msg("[MYFS READ] Using readahead window for large file %s\n", path);
         
-        // For large files, we've already read full fragments, so just reconstruct the requested portion
-        memset(buf, 0, bytes_to_read);
-        for (size_t i = 0; i < bytes_to_read; i++) {
-            size_t file_pos = offset + i;
-            int frag_idx = file_pos % num_data_fragments;
-            size_t pos = file_pos / num_data_fragments;
-            buf[i] = fragments[frag_idx][pos];
+        // Get or create readahead window
+        readahead_window_t* window = get_readahead_window(path, 1);
+        if (!window) {
+            fprintf(stderr, "[MYFS READ ERROR] Failed to get readahead window\n");
+            // Fallback: just reconstruct requested data without window
+            memset(buf, 0, bytes_to_read);
+            for (size_t i = 0; i < bytes_to_read; i++) {
+                size_t file_pos = offset + i;
+                int frag_idx = file_pos % num_data_fragments;
+                size_t pos = file_pos / num_data_fragments;
+                buf[i] = fragments[frag_idx][pos];
+            }
+        } else {
+            // Allocate window buffer if needed
+            if (!window->buffer) {
+                window->buffer = (char*)malloc(READAHEAD_WINDOW_SIZE);
+                if (!window->buffer) {
+                    fprintf(stderr, "[MYFS READ ERROR] Failed to allocate window buffer (%d bytes)\n", 
+                            READAHEAD_WINDOW_SIZE);
+                    // Fallback: just reconstruct requested data
+                    memset(buf, 0, bytes_to_read);
+                    for (size_t i = 0; i < bytes_to_read; i++) {
+                        size_t file_pos = offset + i;
+                        int frag_idx = file_pos % num_data_fragments;
+                        size_t pos = file_pos / num_data_fragments;
+                        buf[i] = fragments[frag_idx][pos];
+                    }
+                    return bytes_to_read;
+                }
+            }
+            
+            // Calculate window range
+            window->start_offset = offset;  // Window starts at current request
+            size_t window_size = READAHEAD_WINDOW_SIZE;
+            
+            // Don't read beyond file end
+            if (window->start_offset + window_size > file_size) {
+                window_size = file_size - window->start_offset;
+            }
+            window->valid_size = window_size;
+            
+            fprintf(stderr, "[MYFS READ] Loading window [%ld - %ld] (%zu bytes)\n", 
+                    window->start_offset, window->start_offset + window_size, window_size);
+            log_msg("[MYFS READ] Window range: [%ld, %ld], size=%zu\n", 
+                    window->start_offset, window->start_offset + window_size, window_size);
+            
+            // Reconstruct window data from fragments
+            memset(window->buffer, 0, window_size);
+            for (size_t i = 0; i < window_size; i++) {
+                size_t file_pos = window->start_offset + i;
+                int frag_idx = file_pos % num_data_fragments;
+                size_t pos = file_pos / num_data_fragments;
+                
+                // Make sure we don't read beyond fragment bounds
+                if (pos < fragment_size) {
+                    window->buffer[i] = fragments[frag_idx][pos];
+                }
+            }
+            
+            // Now copy requested data from window to output buffer
+            size_t copy_size = bytes_to_read;
+            if (copy_size > window_size) {
+                copy_size = window_size;  // Safety check
+            }
+            memcpy(buf, window->buffer, copy_size);
+            
+            fprintf(stderr, "[MYFS READ] ✓ Loaded window and served %zu bytes (window contains %zu bytes)\n", 
+                    copy_size, window_size);
+            log_msg("[MYFS READ] Window loaded, served %zu bytes from window\n", copy_size);
         }
-        
-        fprintf(stderr, "[MYFS READ] ✓ Reconstructed %zu bytes for large file (not cached)\n", bytes_to_read);
     }
     
     fprintf(stderr, "[MYFS READ] ✓ Read complete: %zu bytes (file_size %zu)\n", 
