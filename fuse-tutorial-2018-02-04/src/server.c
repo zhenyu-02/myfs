@@ -89,7 +89,12 @@ void* handle_client(void* arg) {
             }
             
             // Open/create file
-            int fd = open(filepath, O_WRONLY | O_CREAT, 0644);
+            // Use O_TRUNC when offset is 0 to ensure we start fresh
+            int flags = O_WRONLY | O_CREAT;
+            if (req.offset == 0) {
+                flags |= O_TRUNC;  // Clear file when writing from beginning
+            }
+            int fd = open(filepath, flags, 0644);
             if (fd < 0) {
                 perror("open file for write");
                 resp.status = -1;

@@ -190,28 +190,104 @@ static void xor_buffers(char* dest, const char* src, size_t size) {
     }
 }
 
+// Buffer for accumulating writes before sending to storage nodes
+typedef struct {
+    char* buffer;
+    size_t size;
+    size_t capacity;
+    off_t max_offset;
+} write_buffer_t;
+
+static write_buffer_t* get_write_buffer(const char* path, int create) {
+    // For simplicity, use a static buffer for now
+    // In production, you'd want a hash table of buffers per file
+    static write_buffer_t buffer = {NULL, 0, 0, 0};
+    static char last_path[PATH_MAX] = "";
+    
+    // If different file, flush old buffer
+    if (buffer.buffer && strcmp(last_path, path) != 0) {
+        free(buffer.buffer);
+        buffer.buffer = NULL;
+        buffer.size = 0;
+        buffer.capacity = 0;
+        buffer.max_offset = 0;
+    }
+    
+    strncpy(last_path, path, PATH_MAX - 1);
+    
+    if (create && !buffer.buffer) {
+        buffer.capacity = 4 * 1024 * 1024;  // 4MB max
+        buffer.buffer = (char*)malloc(buffer.capacity);
+        buffer.size = 0;
+        buffer.max_offset = 0;
+    }
+    
+    return &buffer;
+}
+
 // Distributed write function
 static int myfs_write(const char* path, const char* buf, size_t size, off_t offset) {
     struct bb_state* state = BB_DATA;
     int num_nodes = state->num_nodes;
     int num_data_fragments = num_nodes - 1;  // n-1 data fragments
     
-    fprintf(stderr, "[MYFS WRITE] ========== START ==========\n");
-    fprintf(stderr, "[MYFS WRITE] path=%s, size=%zu, offset=%ld, nodes=%d\n", 
-            path, size, offset, num_nodes);
+    fprintf(stderr, "[MYFS WRITE] path=%s, size=%zu, offset=%ld\n", 
+            path, size, offset);
     log_msg("\n[MYFS WRITE] path=%s, size=%zu, offset=%ld, num_nodes=%d\n", 
             path, size, offset, num_nodes);
     
-    // Calculate fragment size (divide data among n-1 nodes)
-    size_t fragment_size = (size + num_data_fragments - 1) / num_data_fragments;
-    fprintf(stderr, "[MYFS WRITE] Fragment size: %zu bytes (size=%zu, fragments=%d)\n", 
-            fragment_size, size, num_data_fragments);
-    log_msg("[MYFS WRITE] Fragment size: %zu bytes\n", fragment_size);
+    // Get or create write buffer for this file
+    write_buffer_t* wb = get_write_buffer(path, 1);
+    if (!wb || !wb->buffer) {
+        fprintf(stderr, "[MYFS WRITE ERROR] Failed to allocate write buffer\n");
+        return -ENOMEM;
+    }
+    
+    // Ensure buffer can hold data at this offset
+    size_t required_size = offset + size;
+    if (required_size > wb->capacity) {
+        fprintf(stderr, "[MYFS WRITE ERROR] Write exceeds buffer capacity (%zu > %zu)\n",
+                required_size, wb->capacity);
+        return -EFBIG;
+    }
+    
+    // Copy data to buffer
+    memcpy(wb->buffer + offset, buf, size);
+    if (offset + size > wb->size) {
+        wb->size = offset + size;
+    }
+    if (offset + size > wb->max_offset) {
+        wb->max_offset = offset + size;
+    }
+    
+    fprintf(stderr, "[MYFS WRITE] Buffered %zu bytes at offset %ld (total buffered: %zu)\n",
+            size, offset, wb->size);
+    
+    // Return success - actual distribution happens on flush/close
+    return size;
+}
+
+// Function to actually send buffered data to storage nodes
+static int myfs_flush_write_buffer(const char* path) {
+    struct bb_state* state = BB_DATA;
+    int num_nodes = state->num_nodes;
+    int num_data_fragments = num_nodes - 1;
+    
+    write_buffer_t* wb = get_write_buffer(path, 0);
+    if (!wb || !wb->buffer || wb->size == 0) {
+        return 0;  // Nothing to flush
+    }
+    
+    fprintf(stderr, "[MYFS FLUSH] ========== DISTRIBUTING %zu BYTES ==========\n", wb->size);
+    log_msg("[MYFS FLUSH] Distributing %zu bytes to %d nodes\n", wb->size, num_nodes);
+    
+    // Calculate fragment size
+    size_t fragment_size = (wb->size + num_data_fragments - 1) / num_data_fragments;
+    
+    fprintf(stderr, "[MYFS FLUSH] Fragment size: %zu bytes (total: %zu)\n", 
+            fragment_size, wb->size);
     
     // Allocate buffers for fragments
-    fprintf(stderr, "[MYFS WRITE] Allocating memory: %d fragments × %zu bytes = %zu bytes total\n",
-            num_nodes, fragment_size, num_nodes * fragment_size);
-    
     char** fragments = (char**)malloc(num_nodes * sizeof(char*));
     if (!fragments) {
         fprintf(stderr, "[MYFS WRITE ERROR] Failed to allocate fragment pointer array\n");
@@ -239,27 +315,27 @@ static int myfs_write(const char* path, const char* buf, size_t size, off_t offs
             return -ENOMEM;
         }
     }
-    fprintf(stderr, "[MYFS WRITE] ✓ Memory allocated successfully\n");
     
-    // Split data into n-1 fragments
-    fprintf(stderr, "[MYFS WRITE] Splitting data into %d data fragments...\n", num_data_fragments);
-    for (size_t i = 0; i < size; i++) {
-        int frag_idx = (i / fragment_size) % num_data_fragments;
-        size_t pos = i % fragment_size;
-        fragments[frag_idx][pos] = buf[i];
+    // Distribute buffered data across fragments
+    fprintf(stderr, "[MYFS FLUSH] Distributing data across %d data fragments...\n", num_data_fragments);
+    for (size_t i = 0; i < wb->size; i++) {
+        int frag_idx = (i / fragment_size) % num_data_fragments;  // Which fragment
+        size_t frag_pos = i % fragment_size;  // Position within fragment
+        
+        if (frag_idx < num_data_fragments && frag_pos < fragment_size) {
+            fragments[frag_idx][frag_pos] = wb->buffer[i];
+        }
     }
-    fprintf(stderr, "[MYFS WRITE] ✓ Data split complete\n");
     
     // Calculate parity fragment (XOR of all data fragments)
-    fprintf(stderr, "[MYFS WRITE] Calculating parity (XOR) for fragment %d...\n", num_nodes - 1);
+    fprintf(stderr, "[MYFS FLUSH] Calculating parity (XOR) for fragment %d...\n", num_nodes - 1);
     memset(fragments[num_nodes - 1], 0, fragment_size);
     for (int i = 0; i < num_data_fragments; i++) {
         xor_buffers(fragments[num_nodes - 1], fragments[i], fragment_size);
     }
-    fprintf(stderr, "[MYFS WRITE] ✓ Parity calculated\n");
     
     // Send fragments to nodes
-    fprintf(stderr, "[MYFS WRITE] Sending fragments to %d nodes...\n", num_nodes);
+    fprintf(stderr, "[MYFS FLUSH] Sending fragments to %d nodes...\n", num_nodes);
     int retstat = 0;
     for (int i = 0; i < num_nodes; i++) {
         request_header_t req;
@@ -268,10 +344,10 @@ static int myfs_write(const char* path, const char* buf, size_t size, off_t offs
         req.type = REQ_WRITE;
         strncpy(req.filename, path + 1, sizeof(req.filename) - 1);  // Skip leading '/'
         req.size = fragment_size;
-        req.offset = 0;  // Always write from start of fragment file (for simplicity)
+        req.offset = 0;  // Write entire fragment from beginning
         req.fragment_id = i;
         
-        fprintf(stderr, "[MYFS WRITE] Node %d: Sending header (file=%s, frag=%u, size=%zu, offset=%ld)...\n",
+        fprintf(stderr, "[MYFS FLUSH] Node %d: Sending header (file=%s, frag=%u, size=%zu, offset=%ld)...\n",
                 i, req.filename, req.fragment_id, req.size, req.offset);
         
         // Send request header (with retry on connection failure)
@@ -284,9 +360,9 @@ static int myfs_write(const char* path, const char* buf, size_t size, off_t offs
             
             // Send failed, try to reconnect
             if (retry == 0) {
-                fprintf(stderr, "[MYFS WRITE] ⚠ Node %d: Send header failed, attempting reconnect...\n", i);
+                fprintf(stderr, "[MYFS FLUSH] ⚠ Node %d: Send header failed, attempting reconnect...\n", i);
                 if (reconnect_to_node(i) < 0) {
-                    fprintf(stderr, "[MYFS WRITE ERROR] Node %d: Reconnect failed\n", i);
+                    fprintf(stderr, "[MYFS FLUSH ERROR] Node %d: Reconnect failed\n", i);
                     break;
                 }
                 // Retry with new connection
@@ -294,50 +370,50 @@ static int myfs_write(const char* path, const char* buf, size_t size, off_t offs
         }
         
         if (!send_success) {
-            fprintf(stderr, "[MYFS WRITE ERROR] Failed to send request header to node %d after retry\n", i);
+            fprintf(stderr, "[MYFS FLUSH ERROR] Failed to send request header to node %d after retry\n", i);
             log_msg("Failed to send request to node %d\n", i);
             retstat = -EIO;
             goto cleanup;
         }
         
-        fprintf(stderr, "[MYFS WRITE] Node %d: Sending data (%zu bytes)...\n", i, fragment_size);
+        fprintf(stderr, "[MYFS FLUSH] Node %d: Sending data (%zu bytes)...\n", i, fragment_size);
         
         // Send data
         if (send_all(state->nodes[i].socket_fd, fragments[i], fragment_size) != (ssize_t)fragment_size) {
-            fprintf(stderr, "[MYFS WRITE ERROR] Failed to send data to node %d\n", i);
+            fprintf(stderr, "[MYFS FLUSH ERROR] Failed to send data to node %d\n", i);
             log_msg("Failed to send data to node %d\n", i);
             retstat = -EIO;
             goto cleanup;
         }
         
-        fprintf(stderr, "[MYFS WRITE] Node %d: Waiting for response...\n", i);
+        fprintf(stderr, "[MYFS FLUSH] Node %d: Waiting for response...\n", i);
         
         // Receive response
         if (recv(state->nodes[i].socket_fd, &resp, sizeof(resp), MSG_WAITALL) != sizeof(resp)) {
-            fprintf(stderr, "[MYFS WRITE ERROR] Failed to receive response from node %d\n", i);
+            fprintf(stderr, "[MYFS FLUSH ERROR] Failed to receive response from node %d\n", i);
             log_msg("Failed to receive response from node %d\n", i);
             retstat = -EIO;
             goto cleanup;
         }
         
         if (resp.status != 0) {
-            fprintf(stderr, "[MYFS WRITE ERROR] Node %d returned error: status=%d, errno=%d\n", 
+            fprintf(stderr, "[MYFS FLUSH ERROR] Node %d returned error: status=%d, errno=%d\n", 
                     i, resp.status, resp.error_code);
-            log_msg("[MYFS WRITE ERROR] Node %d returned error: %d\n", i, resp.error_code);
+            log_msg("[MYFS FLUSH ERROR] Node %d returned error: %d\n", i, resp.error_code);
             retstat = -resp.error_code;
             goto cleanup;
         }
         
-        fprintf(stderr, "[MYFS WRITE] ✓ Node %d: Fragment %d written successfully (%zu bytes)\n", 
+        fprintf(stderr, "[MYFS FLUSH] ✓ Node %d: Fragment %d written successfully (%zu bytes)\n", 
                 i, i, fragment_size);
-        log_msg("[MYFS WRITE] Successfully wrote fragment %d to node %d\n", i, i);
+        log_msg("[MYFS FLUSH] Successfully wrote fragment %d to node %d\n", i, i);
     }
     
-    fprintf(stderr, "[MYFS WRITE] ========== COMPLETE: %zu bytes written ==========\n", size);
-    retstat = size;  // Return number of bytes written
+    fprintf(stderr, "[MYFS FLUSH] ========== COMPLETE: %zu bytes written ==========\n", wb->size);
+    retstat = wb->size;  // Return number of bytes written
     
 cleanup:
-    fprintf(stderr, "[MYFS WRITE] Cleanup: Freeing %d fragment buffers\n", num_nodes);
+    fprintf(stderr, "[MYFS FLUSH] Cleanup: Freeing %d fragment buffers\n", num_nodes);
     for (int i = 0; i < num_nodes; i++) {
         if (fragments[i]) {
             free(fragments[i]);
@@ -346,7 +422,11 @@ cleanup:
     free(fragments);
     
     if (retstat < 0) {
-        fprintf(stderr, "[MYFS WRITE] ========== FAILED: error=%d ==========\n", retstat);
+        fprintf(stderr, "[MYFS FLUSH] ========== FAILED: error=%d ==========\n", retstat);
+    } else {
+        // Clear buffer after successful flush
+        wb->size = 0;
+        wb->max_offset = 0;
     }
     
     return retstat;
@@ -981,6 +1061,15 @@ int bb_flush(const char *path, struct fuse_file_info *fi)
     log_msg("\nbb_flush(path=\"%s\", fi=0x%08x)\n", path, fi);
     // no need to get fpath on this one, since I work from fi->fh not the path
     log_fi(fi);
+    
+    // Flush any buffered writes to storage nodes
+    if (BB_DATA->num_nodes > 0) {
+        int ret = myfs_flush_write_buffer(path);
+        if (ret < 0) {
+            log_msg("[MYFS] Flush failed: %d\n", ret);
+            return ret;
+        }
+    }
 	
     return 0;
 }
@@ -1004,6 +1093,15 @@ int bb_release(const char *path, struct fuse_file_info *fi)
     log_msg("\nbb_release(path=\"%s\", fi=0x%08x)\n",
 	  path, fi);
     log_fi(fi);
+    
+    // Flush any remaining buffered writes before closing
+    if (BB_DATA->num_nodes > 0) {
+        int ret = myfs_flush_write_buffer(path);
+        if (ret < 0) {
+            log_msg("[MYFS] Final flush on release failed: %d\n", ret);
+            // Continue with close even if flush fails
+        }
+    }
 
     // We need to close the file.  Had we allocated any resources
     // (buffers etc) we'd need to free them here as well.
