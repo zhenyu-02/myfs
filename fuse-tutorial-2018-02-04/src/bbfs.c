@@ -752,6 +752,7 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         // Large file: check readahead window first
         readahead_window_t* window = get_readahead_window(path, 0);
         if (window && window->buffer && strcmp(window->path, path) == 0 &&
+            window->start_offset >= 0 &&  // Ensure window has been initialized
             offset >= window->start_offset && 
             offset + bytes_to_read <= window->start_offset + window->valid_size) {
             
@@ -768,7 +769,12 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         }
         
         // Window miss - will need to load new window from network
-        fprintf(stderr, "[MYFS READAHEAD MISS] Need to load new window for offset=%ld\n", offset);
+        if (window && window->buffer && strcmp(window->path, path) == 0) {
+            fprintf(stderr, "[MYFS READAHEAD MISS] Window exists but miss: offset=%ld not in [%ld,%ld]\n", 
+                    offset, window->start_offset, window->start_offset + window->valid_size);
+        } else {
+            fprintf(stderr, "[MYFS READAHEAD MISS] Need to load new window for offset=%ld\n", offset);
+        }
     }
     
     // Cache/Window miss - need to read from network
@@ -1032,8 +1038,10 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
                 buf[i] = fragments[frag_idx][pos];
             }
         } else {
-            // Allocate window buffer if needed
+            // Check if we need to reload window (if offset moved outside current window)
+            int need_reload = 0;
             if (!window->buffer) {
+                // No buffer allocated yet
                 window->buffer = (char*)malloc(READAHEAD_WINDOW_SIZE);
                 if (!window->buffer) {
                     fprintf(stderr, "[MYFS READ ERROR] Failed to allocate window buffer (%d bytes)\n", 
@@ -1048,50 +1056,64 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
                     }
                     return bytes_to_read;
                 }
+                need_reload = 1;
+            } else if (window->start_offset < 0 || 
+                       offset < window->start_offset || 
+                       offset >= window->start_offset + window->valid_size) {
+                // Current request is outside the existing window
+                need_reload = 1;
+                fprintf(stderr, "[MYFS READ] Window reload needed: offset=%ld not in current window [%ld,%ld]\n",
+                        offset, window->start_offset, window->start_offset + window->valid_size);
             }
             
-            // Calculate window range
-            window->start_offset = offset;  // Window starts at current request
-            size_t window_size = READAHEAD_WINDOW_SIZE;
-            
-            // Don't read beyond file end
-            if (window->start_offset + window_size > file_size) {
-                window_size = file_size - window->start_offset;
-            }
-            window->valid_size = window_size;
-            
-            fprintf(stderr, "[MYFS READ] Loading window [%ld - %ld] (%zu bytes)\n", 
-                    window->start_offset, window->start_offset + window_size, window_size);
-            log_msg("[MYFS READ] Window range: [%ld, %ld], size=%zu\n", 
-                    window->start_offset, window->start_offset + window_size, window_size);
-            
-            // Reconstruct window data from fragments
-            // Note: When window doesn't start at offset 0, we need to properly handle the offset
-            memset(window->buffer, 0, window_size);
-            for (size_t i = 0; i < window_size; i++) {
-                size_t file_pos = window->start_offset + i;
-                // Round-robin distribution: byte at position 'file_pos' is in:
-                // - fragment (file_pos % num_data_fragments)
-                // - at position (file_pos / num_data_fragments) within that fragment
-                int frag_idx = file_pos % num_data_fragments;
-                size_t pos = file_pos / num_data_fragments;
+            if (need_reload) {
+                // Calculate new window range
+                window->start_offset = offset;  // Window starts at current request
+                size_t window_size = READAHEAD_WINDOW_SIZE;
                 
-                // Make sure we don't read beyond fragment bounds
-                if (pos < fragment_size) {
-                    window->buffer[i] = fragments[frag_idx][pos];
+                // Don't read beyond file end
+                if (window->start_offset + window_size > file_size) {
+                    window_size = file_size - window->start_offset;
                 }
+                window->valid_size = window_size;
+            
+                
+                fprintf(stderr, "[MYFS READ] Loading window [%ld - %ld] (%zu bytes)\n", 
+                        window->start_offset, window->start_offset + window_size, window_size);
+                log_msg("[MYFS READ] Window range: [%ld, %ld], size=%zu\n", 
+                        window->start_offset, window->start_offset + window_size, window_size);
+                
+                // Reconstruct window data from fragments
+                memset(window->buffer, 0, window_size);
+                for (size_t i = 0; i < window_size; i++) {
+                    size_t file_pos = window->start_offset + i;
+                    int frag_idx = file_pos % num_data_fragments;
+                    size_t pos = file_pos / num_data_fragments;
+                    
+                    // Make sure we don't read beyond fragment bounds
+                    if (pos < fragment_size) {
+                        window->buffer[i] = fragments[frag_idx][pos];
+                    }
+                }
+                
+                fprintf(stderr, "[MYFS READ] ✓ Window loaded with %zu bytes\n", window_size);
+            } else {
+                // Window already contains the data we need
+                fprintf(stderr, "[MYFS READ] Using existing window [%ld - %ld]\n", 
+                        window->start_offset, window->start_offset + window->valid_size);
             }
             
             // Now copy requested data from window to output buffer
+            size_t window_offset = offset - window->start_offset;
             size_t copy_size = bytes_to_read;
-            if (copy_size > window_size) {
-                copy_size = window_size;  // Safety check
+            if (window_offset + copy_size > window->valid_size) {
+                copy_size = window->valid_size - window_offset;  // Safety check
             }
-            memcpy(buf, window->buffer, copy_size);
+            memcpy(buf, window->buffer + window_offset, copy_size);
             
-            fprintf(stderr, "[MYFS READ] ✓ Loaded window and served %zu bytes (window contains %zu bytes)\n", 
-                    copy_size, window_size);
-            log_msg("[MYFS READ] Window loaded, served %zu bytes from window\n", copy_size);
+            fprintf(stderr, "[MYFS READ] ✓ Served %zu bytes from window at offset %ld\n", 
+                    copy_size, offset);
+            log_msg("[MYFS READ] Served %zu bytes from window\n", copy_size);
         }
     }
     
