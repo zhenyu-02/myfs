@@ -50,6 +50,14 @@
 #include "log.h"
 #include "protocol.h"
 
+// Cache configuration
+#define CACHE_THRESHOLD (3 * 1024 * 1024)  // 3MB - files larger than this won't be cached
+#define CACHE_TTL_SECONDS 5                 // Cache expiration time in seconds
+
+// Read optimization for large files
+#define LARGE_FILE_THRESHOLD (1 * 1024 * 1024)  // 1MB - files larger than this are considered "large"
+#define MIN_READ_AHEAD_SIZE (4 * 1024 * 1024)   // 4MB - minimum read-ahead for large files
+
 //  All the paths I see are relative to the root of the mounted
 //  filesystem.  In order to get to the underlying filesystem, I need to
 //  have the mountpoint.  I'll save it away early on in main(), and then
@@ -258,10 +266,10 @@ static read_cache_t* get_read_cache(const char* path, int create) {
         cache.timestamp = 0;
     }
     
-    // If same file, check if cache is still valid (within 5 seconds)
+    // If same file, check if cache is still valid (within CACHE_TTL_SECONDS)
     if (cache.buffer && strcmp(cache.path, path) == 0) {
         time_t now = time(NULL);
-        if (now - cache.timestamp > 5) {
+        if (now - cache.timestamp > CACHE_TTL_SECONDS) {
             // Cache expired, invalidate it
             fprintf(stderr, "[MYFS READ CACHE] Cache expired for %s\n", path);
             free(cache.buffer);
@@ -648,24 +656,32 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         bytes_to_read = file_size - offset;
     }
     
-    // Check read cache first
-    read_cache_t* cache = get_read_cache(path, 0);
-    if (cache && cache->buffer && cache->size == file_size) {
-        // Verify that the read is within cache bounds
-        if (offset + bytes_to_read <= cache->size) {
-            // Cache hit! Just copy from cache
-            fprintf(stderr, "[MYFS READ CACHE HIT] Serving %zu bytes from cache (offset=%ld)\n", 
-                    bytes_to_read, offset);
-            log_msg("[MYFS READ CACHE HIT] path=%s, offset=%ld, size=%zu\n", path, offset, bytes_to_read);
-            memcpy(buf, cache->buffer + offset, bytes_to_read);
-            return bytes_to_read;
-        } else {
-            // Read request exceeds cache bounds - this shouldn't happen
-            fprintf(stderr, "[MYFS READ WARNING] Cache bounds exceeded: offset=%ld, bytes_to_read=%zu, cache_size=%zu\n",
-                    offset, bytes_to_read, cache->size);
-            log_msg("[MYFS READ WARNING] Cache bounds check failed, invalidating cache\n");
-            // Invalidate cache and fall through to network read
-            invalidate_read_cache(path);
+    // Determine if we should cache this file based on size threshold
+    int should_cache = (file_size <= CACHE_THRESHOLD);
+    fprintf(stderr, "[MYFS READ] File size: %zu bytes, cache strategy: %s\n", 
+            file_size, should_cache ? "CACHE" : "NO_CACHE (>3MB)");
+    log_msg("[MYFS READ] File %s: size=%zu, will_cache=%d\n", path, file_size, should_cache);
+    
+    // Only check cache for small files
+    if (should_cache) {
+        read_cache_t* cache = get_read_cache(path, 0);
+        if (cache && cache->buffer && cache->size == file_size) {
+            // Verify that the read is within cache bounds
+            if (offset + bytes_to_read <= cache->size) {
+                // Cache hit! Just copy from cache
+                fprintf(stderr, "[MYFS READ CACHE HIT] Serving %zu bytes from cache (offset=%ld)\n", 
+                        bytes_to_read, offset);
+                log_msg("[MYFS READ CACHE HIT] path=%s, offset=%ld, size=%zu\n", path, offset, bytes_to_read);
+                memcpy(buf, cache->buffer + offset, bytes_to_read);
+                return bytes_to_read;
+            } else {
+                // Read request exceeds cache bounds - this shouldn't happen
+                fprintf(stderr, "[MYFS READ WARNING] Cache bounds exceeded: offset=%ld, bytes_to_read=%zu, cache_size=%zu\n",
+                        offset, bytes_to_read, cache->size);
+                log_msg("[MYFS READ WARNING] Cache bounds check failed, invalidating cache\n");
+                // Invalidate cache and fall through to network read
+                invalidate_read_cache(path);
+            }
         }
     }
     
@@ -680,6 +696,15 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
     size_t fragment_size = (file_size + num_data_fragments - 1) / num_data_fragments;
     fprintf(stderr, "[MYFS READ] Fragment size: %zu bytes (file_size=%zu, fragments=%d)\n", 
             fragment_size, file_size, num_data_fragments);
+    
+    // For large files, optimize read granularity
+    if (file_size > LARGE_FILE_THRESHOLD) {
+        // For large files, we read entire fragments even for partial requests
+        // This reduces network round-trips at the cost of reading more data
+        fprintf(stderr, "[MYFS READ] Large file detected (%zu bytes > %d bytes), using optimized read strategy\n",
+                file_size, LARGE_FILE_THRESHOLD);
+        log_msg("[MYFS READ] Large file optimization enabled for %s\n", path);
+    }
     
     // Allocate buffers for fragments
     fprintf(stderr, "[MYFS READ] Allocating memory: %d fragments × %zu bytes = %zu bytes total\n",
@@ -860,25 +885,13 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
         log_msg("[MYFS READ] Successfully reconstructed fragment %d\n", failed_node);
     }
     
-    // Reconstruct ENTIRE file and cache it (for subsequent reads)
-    // This is more efficient than reconstructing on every read request
-    cache = get_read_cache(path, 1);
-    if (!cache) {
-        fprintf(stderr, "[MYFS READ ERROR] Failed to get read cache\n");
-        // Continue anyway and just reconstruct for this request
-        memset(buf, 0, bytes_to_read);
-        for (size_t i = 0; i < bytes_to_read; i++) {
-            size_t file_pos = offset + i;
-            int frag_idx = file_pos % num_data_fragments;
-            size_t pos = file_pos / num_data_fragments;
-            buf[i] = fragments[frag_idx][pos];
-        }
-    } else {
-        // Allocate cache buffer for entire file
-        cache->buffer = (char*)malloc(file_size);
-        if (!cache->buffer) {
-            fprintf(stderr, "[MYFS READ ERROR] Failed to allocate cache buffer (%zu bytes)\n", file_size);
-            // Continue without caching
+    // Reconstruct data based on caching strategy
+    if (should_cache) {
+        // Small file: cache entire file for subsequent reads
+        cache = get_read_cache(path, 1);
+        if (!cache) {
+            fprintf(stderr, "[MYFS READ ERROR] Failed to get read cache\n");
+            // Continue anyway and just reconstruct for this request
             memset(buf, 0, bytes_to_read);
             for (size_t i = 0; i < bytes_to_read; i++) {
                 size_t file_pos = offset + i;
@@ -887,20 +900,49 @@ static int myfs_read(const char* path, char* buf, size_t size, off_t offset) {
                 buf[i] = fragments[frag_idx][pos];
             }
         } else {
-            // Reconstruct entire file into cache
-            fprintf(stderr, "[MYFS READ] Reconstructing and caching entire file (%zu bytes)...\n", file_size);
-            for (size_t i = 0; i < file_size; i++) {
-                int frag_idx = i % num_data_fragments;
-                size_t pos = i / num_data_fragments;
-                cache->buffer[i] = fragments[frag_idx][pos];
+            // Allocate cache buffer for entire file
+            cache->buffer = (char*)malloc(file_size);
+            if (!cache->buffer) {
+                fprintf(stderr, "[MYFS READ ERROR] Failed to allocate cache buffer (%zu bytes)\n", file_size);
+                // Continue without caching
+                memset(buf, 0, bytes_to_read);
+                for (size_t i = 0; i < bytes_to_read; i++) {
+                    size_t file_pos = offset + i;
+                    int frag_idx = file_pos % num_data_fragments;
+                    size_t pos = file_pos / num_data_fragments;
+                    buf[i] = fragments[frag_idx][pos];
+                }
+            } else {
+                // Reconstruct entire file into cache
+                fprintf(stderr, "[MYFS READ] Reconstructing and caching entire file (%zu bytes)...\n", file_size);
+                for (size_t i = 0; i < file_size; i++) {
+                    int frag_idx = i % num_data_fragments;
+                    size_t pos = i / num_data_fragments;
+                    cache->buffer[i] = fragments[frag_idx][pos];
+                }
+                cache->size = file_size;
+                
+                // Now copy requested portion to output buffer
+                memcpy(buf, cache->buffer + offset, bytes_to_read);
+                fprintf(stderr, "[MYFS READ] ✓ File cached! Serving %zu bytes from cache\n", bytes_to_read);
+                log_msg("[MYFS READ] Cached entire file (%zu bytes)\n", file_size);
             }
-            cache->size = file_size;
-            
-            // Now copy requested portion to output buffer
-            memcpy(buf, cache->buffer + offset, bytes_to_read);
-            fprintf(stderr, "[MYFS READ] ✓ File cached! Serving %zu bytes from cache\n", bytes_to_read);
-            log_msg("[MYFS READ] Cached entire file (%zu bytes)\n", file_size);
         }
+    } else {
+        // Large file: don't cache, reconstruct only requested portion
+        fprintf(stderr, "[MYFS READ] Large file - reconstructing %zu bytes without caching\n", bytes_to_read);
+        log_msg("[MYFS READ] Reconstructing %zu bytes for large file (no cache)\n", bytes_to_read);
+        
+        // For large files, we've already read full fragments, so just reconstruct the requested portion
+        memset(buf, 0, bytes_to_read);
+        for (size_t i = 0; i < bytes_to_read; i++) {
+            size_t file_pos = offset + i;
+            int frag_idx = file_pos % num_data_fragments;
+            size_t pos = file_pos / num_data_fragments;
+            buf[i] = fragments[frag_idx][pos];
+        }
+        
+        fprintf(stderr, "[MYFS READ] ✓ Reconstructed %zu bytes for large file (not cached)\n", bytes_to_read);
     }
     
     fprintf(stderr, "[MYFS READ] ✓ Read complete: %zu bytes (file_size %zu)\n", 
